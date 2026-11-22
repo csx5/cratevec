@@ -1,0 +1,16 @@
+[package]
+name = "cratevec-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cratevec"
+path = "src/main.rs"
+
+[dependencies]
+cratevec-core = { path = "../cratevec-core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

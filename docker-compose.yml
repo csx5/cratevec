@@ -1,0 +1,9 @@
+services:
+  cratevec:
+    build: .
+    container_name: cratevec
+    ports:
+      - "7420:7420"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

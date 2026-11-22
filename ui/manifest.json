@@ -1,0 +1,9 @@
+{
+  "name": "cratevec",
+  "short_name": "cratevec",
+  "description": "DSP-driven music discovery and vector crate digging engine",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#111214",
+  "theme_color": "#111214"
+}

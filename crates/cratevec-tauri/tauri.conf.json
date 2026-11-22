@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "cratevec",
+  "version": "0.1.0",
+  "identifier": "dev.cratevec.app",
+  "build": {
+    "frontendDist": "../../ui",
+    "devUrl": "http://127.0.0.1:7420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "cratevec // DSP Audio Discovery",
+        "width": 1340,
+        "height": 840,
+        "minWidth": 900,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

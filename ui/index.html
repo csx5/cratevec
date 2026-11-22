@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>cratevec // DSP Audio Discovery</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-name">CRATEVEC</span>
+      <span class="brand-sub">RUST DSP // 48-D VECTOR ENGINE</span>
+    </div>
+
+    <form id="seed-form" class="seed-bar" autocomplete="off">
+      <div class="input-group suggest-wrap">
+        <label for="seed-input" class="input-label">SEED / SPOTIFY-URL</label>
+        <input
+          id="seed-input"
+          type="text"
+          value="PIXY - LEGACY"
+          placeholder="Artist - Track oder open.spotify.com/track/..."
+          required
+        >
+        <div id="seed-suggest" class="suggest-dropdown hidden"></div>
+      </div>
+      <button type="submit" id="btn-start-session" class="btn btn-primary">NEUE SESSION</button>
+    </form>
+
+    <form id="bridge-form" class="bridge-bar" autocomplete="off">
+      <div class="input-group suggest-wrap">
+        <label for="bridge-input" class="input-label">BRIDGE (+ SEED KREUZEN)</label>
+        <input
+          id="bridge-input"
+          type="text"
+          placeholder="Zweiten Song kreuzen (z.B. 2hollis, Crystal Castles)..."
+        >
+        <div id="bridge-suggest" class="suggest-dropdown hidden"></div>
+      </div>
+      <button type="submit" id="btn-add-bridge" class="btn">KREUZEN</button>
+    </form>
+
+    <div class="node-status">
+      <button type="button" id="btn-node-config" class="btn btn-small" title="Hybrid-Modus: Lokale Engine oder Remote-Server konfigurieren">
+        NODE: <span id="node-label">LOCAL :7420</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="workbench">
+    <!-- LEFT PANE: SEEDS, TRIANGLE MIXER & UNDERGROUND CONTROL -->
+    <aside class="pane pane-left">
+      <section class="panel-section">
+        <div class="section-header">
+          <span>AKTIVE SEEDS (ANKER)</span>
+          <span id="seed-count-badge" class="mono-badge">0</span>
+        </div>
+        <div id="seed-list" class="seed-list">
+          <div class="empty-hint">Noch keine Session gestartet.</div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-header">
+          <span>STEM-GEWICHTUNG (DREIECKS-MIXER)</span>
+          <button type="button" id="btn-reset-weights" class="link-btn">RESET</button>
+        </div>
+        <div class="triangle-wrap">
+          <canvas id="triangle-canvas" width="230" height="195"></canvas>
+          <div class="weight-readout">
+            <div><span>BEAT/808</span><strong id="val-w-beat">38%</strong></div>
+            <div><span>VOCALS</span><strong id="val-w-vocal">31%</strong></div>
+            <div><span>ATMO</span><strong id="val-w-atmo">31%</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-header">
+          <span>POPULARITAET / UNDERGROUND</span>
+          <span id="val-underground" class="mono-badge">+35% UG</span>
+        </div>
+        <div class="slider-box">
+          <input
+            type="range"
+            id="slider-underground"
+            min="-100"
+            max="100"
+            value="35"
+          >
+          <div class="slider-labels">
+            <span>MAINSTREAM</span>
+            <span>NEUTRAL</span>
+            <span>DEEP CRATE</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-header">
+          <span>NEGATIV-FILTER (KILL VIBE)</span>
+          <span id="neg-count-badge" class="mono-badge">0</span>
+        </div>
+        <div id="negative-list" class="compact-list">
+          <div class="empty-hint">Swipe nach unten schneidet unerwuenschte Klang-Cluster ab.</div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- CENTER PANE: SWIPE DECK & 2D SONIC MAP -->
+    <section class="pane pane-center">
+      <div class="view-tabs">
+        <button type="button" class="tab-btn active" data-view="deck">01 // SWIPE DECK</button>
+        <button type="button" class="tab-btn" data-view="map">02 // 2D SONIC MAP</button>
+        <div class="pool-telemetry">
+          <span>POOL: <strong id="stat-pool">0</strong></span>
+          <span>GEPRUEFT: <strong id="stat-seen">0</strong></span>
+        </div>
+      </div>
+
+      <!-- Loading Overlay -->
+      <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="loader-box">
+          <div class="loader-title" id="loader-title">RUST DSP PIPELINE AKTIV</div>
+          <div class="loader-sub" id="loader-sub">Lade 30s-Audio-Streams & berechne FFT/MFCC/808-Vektoren...</div>
+          <div class="loader-bar"><div class="loader-bar-fill"></div></div>
+        </div>
+      </div>
+
+      <!-- VIEW 1: SWIPE DECK -->
+      <div id="view-deck" class="center-view">
+        <div id="deck-empty" class="deck-empty">
+          <p class="deck-empty-title">BEREIT FUER SEED-ANALYSE</p>
+          <p class="deck-empty-sub">Gib oben einen Track (z. B. <code>PIXY - LEGACY</code>) oder einen Spotify-Link ein und starte die Analyse.</p>
+          <div class="quick-seeds">
+            <span class="quick-label">SCHNELLSTART:</span>
+            <button type="button" class="btn btn-small quick-seed-btn" data-seed="PIXY - LEGACY">PIXY - LEGACY</button>
+            <button type="button" class="btn btn-small quick-seed-btn" data-seed="2hollis - jeans">2hollis - jeans</button>
+            <button type="button" class="btn btn-small quick-seed-btn" data-seed="Crystal Castles - Kerosene">Crystal Castles - Kerosene</button>
+            <button type="button" class="btn btn-small quick-seed-btn" data-seed="Gesaffelstein - Pursuit">Gesaffelstein - Pursuit</button>
+          </div>
+        </div>
+
+        <div id="track-card" class="track-card hidden">
+          <div class="card-top">
+            <img id="card-cover" class="card-cover" src="" alt="Cover">
+            <div class="card-meta">
+              <div class="card-score-row">
+                <span id="card-total-score" class="score-pill">--% MATCH</span>
+                <span id="card-channel" class="channel-tag">--</span>
+                <a id="card-spotify-link" href="#" target="_blank" rel="noopener" class="ext-link">SPOTIFY OPEN</a>
+                <a id="card-source-link" href="#" target="_blank" rel="noopener" class="ext-link">QUELLE</a>
+              </div>
+              <h2 id="card-title" class="card-title">--</h2>
+              <div id="card-artist" class="card-artist">--</div>
+              <div id="card-album" class="card-album">--</div>
+            </div>
+          </div>
+
+          <!-- 3-Dimension DSP Bars -->
+          <div class="dsp-meters">
+            <div class="meter-row">
+              <span class="meter-label">BEAT / 808</span>
+              <div class="meter-track"><div id="bar-beat" class="meter-fill" style="width:0%"></div></div>
+              <span id="pct-beat" class="meter-val">0%</span>
+            </div>
+            <div class="meter-row">
+              <span class="meter-label">VOCAL TIMBRE</span>
+              <div class="meter-track"><div id="bar-vocal" class="meter-fill" style="width:0%"></div></div>
+              <span id="pct-vocal" class="meter-val">0%</span>
+            </div>
+            <div class="meter-row">
+              <span class="meter-label">ATMO / SYNTH</span>
+              <div class="meter-track"><div id="bar-atmo" class="meter-fill" style="width:0%"></div></div>
+              <span id="pct-atmo" class="meter-val">0%</span>
+            </div>
+          </div>
+
+          <!-- Technical DSP Badges -->
+          <div id="card-badges" class="card-badges"></div>
+
+          <!-- Waveform & Drop-Sniper Player -->
+          <div class="player-box">
+            <div class="player-header">
+              <div class="player-controls">
+                <button type="button" id="btn-play-toggle" class="btn btn-small">PLAY [SPACE]</button>
+                <button type="button" id="btn-jump-drop" class="btn btn-small">DROP [<span id="drop-time-label">0.0s</span>]</button>
+              </div>
+              <label class="drop-sniper-toggle">
+                <input type="checkbox" id="chk-auto-drop" checked>
+                <span>DROP-SNIPER AUTO-SEEK</span>
+              </label>
+              <span id="player-time" class="mono-time">00.0s / 30.0s</span>
+            </div>
+            <canvas id="waveform-canvas" width="620" height="76"></canvas>
+            <audio id="audio-player" preload="auto"></audio>
+          </div>
+
+          <!-- 4-Way Swipe Control Bar -->
+          <div class="swipe-controls">
+            <button type="button" id="btn-swipe-left" class="swipe-btn swipe-left" title="Tastatur: Pfeil Links oder A">
+              <span class="swipe-dir">[LEFT / A]</span>
+              <span class="swipe-name">SKIP</span>
+            </button>
+            <button type="button" id="btn-swipe-down" class="swipe-btn swipe-down" title="Tastatur: Pfeil Unten oder S">
+              <span class="swipe-dir">[DOWN / S]</span>
+              <span class="swipe-name">KILL VIBE</span>
+            </button>
+            <button type="button" id="btn-swipe-up" class="swipe-btn swipe-up" title="Tastatur: Pfeil Oben oder W">
+              <span class="swipe-dir">[UP / W]</span>
+              <span class="swipe-name">SUPER-SEED</span>
+            </button>
+            <button type="button" id="btn-swipe-right" class="swipe-btn swipe-right" title="Tastatur: Pfeil Rechts oder D">
+              <span class="swipe-dir">[RIGHT / D]</span>
+              <span class="swipe-name">IN CRATE</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 2: 2D SONIC MAP -->
+      <div id="view-map" class="center-view hidden">
+        <div class="map-container">
+          <canvas id="sonic-map-canvas" width="640" height="460"></canvas>
+          <div id="map-inspector" class="map-inspector">
+            <div class="inspector-info">
+              <strong id="insp-title">Punkt auf der Karte anklicken</strong>
+              <span id="insp-sub">Klick spielt den Song direkt am Beat-Drop an.</span>
+            </div>
+            <div class="inspector-actions">
+              <button type="button" id="btn-insp-like" class="btn btn-small" disabled>IN CRATE</button>
+              <button type="button" id="btn-insp-kill" class="btn btn-small" disabled>KILL VIBE</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT PANE: SAVED CRATE & LIVE RANKED QUEUE -->
+    <aside class="pane pane-right">
+      <section class="panel-section crate-section">
+        <div class="section-header">
+          <span>SESSION CRATE (MERKLISTE)</span>
+          <span id="crate-count-badge" class="mono-badge">0</span>
+        </div>
+        <div class="crate-export-bar">
+          <button type="button" id="btn-export-spotify" class="btn btn-small">SPOTIFY LINKS</button>
+          <button type="button" id="btn-export-m3u" class="btn btn-small">.M3U</button>
+          <button type="button" id="btn-export-json" class="btn btn-small">JSON</button>
+        </div>
+        <div id="crate-list" class="track-list">
+          <div class="empty-hint">Nach rechts oder oben geswipte Songs landen hier.</div>
+        </div>
+      </section>
+
+      <section class="panel-section queue-section">
+        <div class="section-header">
+          <span>LIVE-QUEUE (NACH VEKTOR-RANG)</span>
+          <span class="mono-badge">TOP 12</span>
+        </div>
+        <div id="queue-list" class="track-list">
+          <div class="empty-hint">Wartet auf Session...</div>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <!-- Hybrid Node Configuration Modal -->
+  <div id="node-modal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <div class="section-header">
+        <span>HYBRID ENGINE VERBINDUNG (OPTION C)</span>
+        <button type="button" id="btn-close-modal" class="link-btn">SCHLIESSEN</button>
+      </div>
+      <p class="modal-desc">
+        Standardmaessig nutzt das Interface die lokale Rust-Engine. Du kannst hier auch die Adresse eines Self-Hosted <code>cratevec-server</code> im Heimnetz oder auf einem Server eintragen.
+      </p>
+      <div class="input-group">
+        <label for="input-node-url" class="input-label">BACKEND ENDPOINT URL (leer = lokal)</label>
+        <input id="input-node-url" type="text" placeholder="http://127.0.0.1:7420">
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="btn-save-node" class="btn btn-primary">SPEICHERN & TESTEN</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
