@@ -18,7 +18,7 @@ impl VectorStore {
             let mut p = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             p.push("data");
             let _ = fs::create_dir_all(&p);
-            p.push("vector_cache_v2.json");
+            p.push("vector_cache_v5.json");
             p
         });
 

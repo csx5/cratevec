@@ -75,12 +75,12 @@ async fn main() -> Result<()> {
             seed.meta.album
         );
         println!(
-            "  DSP Telemetry : {:.1} BPM | Drop @ {:.1}s | Sub-Bass: {:.0}% | 808-Distortion: {:.0}% | Glitch: {:.0}% | Darkness: {:.0}%",
+            "  DSP Telemetry : {:.1} BPM | Drop @ {:.1}s | Sub-Bass: {:.0}% | 808-Dist: {:.0}% | Haerte/Aggr: {:.0}% | Darkness: {:.0}%",
             seed.dsp.bpm,
             seed.dsp.drop_start_sec,
             seed.dsp.sub_bass_ratio * 100.0,
             seed.dsp.bass_distortion * 100.0,
-            seed.dsp.glitch_brightness * 100.0,
+            seed.dsp.aggression_index * 100.0,
             seed.dsp.darkness_index * 100.0
         );
     }

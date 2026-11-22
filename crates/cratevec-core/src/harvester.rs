@@ -387,6 +387,10 @@ impl Harvester {
                 || title_low.contains("lullaby")
                 || artist_low.contains("karaoke")
                 || artist_low.contains("tribute")
+                || artist_low.contains("querbeat")
+                || artist_low.contains("kasalla")
+                || artist_low.contains("cat ballou")
+                || title_low.contains("komm ran mit bier")
             {
                 continue;
             }
@@ -606,7 +610,7 @@ impl Harvester {
         // --- STEP 3: Expand 2nd-Hop Related Artists from Top Scene Artists (Critical for Underground Artists) ---
         let mut top_scene_aids: Vec<(f32, u64)> = scene_registry
             .values()
-            .filter(|s| s.artist_id != seed_aid_num)
+            .filter(|s| s.artist_id != seed_aid_num && s.consensus_score >= 2.4)
             .map(|s| (s.consensus_score, s.artist_id))
             .collect();
         top_scene_aids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -637,17 +641,16 @@ impl Harvester {
             }
         }
 
-        // --- STEP 4: Filter Verified Playlist Tracks by Scene Consensus ---
-        // A playlist track is admitted ONLY if its artist has multi-source consensus (in artist graph, radio, or >= 2 playlists),
-        // or if it sits immediately adjacent (dist <= 4) to the seed track in a verified playlist.
+        // --- STEP 4: Filter Verified Playlist Tracks by Multi-Source Scene Consensus ---
+        // A playlist track is admitted ONLY if its artist has true multi-source consensus
+        // (in 1st/2nd-hop artist graph, in artist radio, or appearing in >= 2 independent playlists).
         playlist_candidate_buffer.sort_by_key(|&(_, dist, _)| dist);
-        for (aid, dist, mut t) in playlist_candidate_buffer {
+        for (aid, _dist, mut t) in playlist_candidate_buffer {
             if let Some(stats) = scene_registry.get(&aid) {
                 let is_verified_scene = stats.in_first_hop_graph
                     || stats.in_second_hop_graph
                     || stats.in_artist_radio
-                    || stats.playlist_occurrences >= 2
-                    || dist <= 4;
+                    || stats.playlist_occurrences >= 2;
                 if is_verified_scene {
                     t.scene_affinity = (stats.consensus_score / 5.0).clamp(0.45, 0.98);
                     ch_verified_playlists.push(t);
@@ -686,7 +689,9 @@ impl Harvester {
         // --- STEP 6: Fetch Deep Cuts from High-Consensus Co-Occurring & 2nd-Hop Scene Artists ---
         let mut second_hop_candidates: Vec<(f32, u64)> = scene_registry
             .values()
-            .filter(|s| s.artist_id != seed_aid_num && !s.in_first_hop_graph && s.consensus_score >= 1.5)
+            .filter(|s| {
+                s.artist_id != seed_aid_num && !s.in_first_hop_graph && s.consensus_score >= 2.2
+            })
             .map(|s| (s.consensus_score, s.artist_id))
             .collect();
         second_hop_candidates
@@ -785,6 +790,16 @@ impl Harvester {
             "all out",
             "mega hit",
             "billboard",
+            "festival",
+            "hurricane",
+            "southside",
+            "deichbrand",
+            "karneval",
+            "fasching",
+            "saufen",
+            "malle",
+            "favoriten",
+            "liebling",
         ];
 
         let mut playlist_ids = Vec::new();

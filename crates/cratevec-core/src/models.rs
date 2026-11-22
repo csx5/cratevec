@@ -28,6 +28,10 @@ fn default_scene_affinity() -> f32 {
     0.75
 }
 
+fn default_aggression() -> f32 {
+    0.50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcousticFingerprint {
     pub bpm: f32,
@@ -38,6 +42,9 @@ pub struct AcousticFingerprint {
     pub vocal_presence: f32,
     pub glitch_brightness: f32,
     pub darkness_index: f32,
+    /// 0.0 (calm, chill, laid-back, soft transients) .. 1.0 (aggressive, hard-hitting, high vocal bite & attack)
+    #[serde(default = "default_aggression")]
+    pub aggression_index: f32,
     /// 64 normalized amplitude peaks (0.0..1.0) across the 30s preview for instant waveform UI rendering
     pub waveform_peaks: Vec<f32>,
     /// 16-dim L2-normalized vector: Rhythm, BPM, sub-bass pressure, 808 harmonic distortion, transient punch

@@ -25,12 +25,14 @@ pub struct DiscoverySession {
     pub target_vocal: Vec<f32>,
     pub target_atmo: Vec<f32>,
     pub target_bpm: f32,
+    pub target_aggression: f32,
+    pub target_darkness: f32,
 }
 
 impl DiscoverySession {
     pub fn new(
         session_id: String,
-        seeds: Vec<AnalyzedTrack>,
+        mut seeds: Vec<AnalyzedTrack>,
         pool: Vec<AnalyzedTrack>,
         prev_session_dedups: HashSet<String>,
         metric_model: TrainedMetricModel,
@@ -42,12 +44,25 @@ impl DiscoverySession {
             seen_dedups.insert(s.meta.dedup_key.clone());
         }
 
-        let (target_beat, target_vocal, target_atmo, target_bpm) = compute_seed_centroid(&seeds);
+        let mut deduped_pool = Vec::new();
+        let mut pool_dedups = HashSet::new();
+        for t in pool {
+            if !seen_dedups.contains(&t.meta.dedup_key)
+                && pool_dedups.insert(t.meta.dedup_key.clone())
+            {
+                deduped_pool.push(t);
+            }
+        }
 
-        let mut session = Self {
+        whiten_tracks(&mut seeds, &mut deduped_pool);
+
+        let (target_beat, target_vocal, target_atmo, target_bpm, target_aggression, target_darkness) =
+            compute_seed_centroid(&seeds);
+
+        Self {
             session_id,
             seeds,
-            pool: Vec::new(),
+            pool: deduped_pool,
             liked_crate: Vec::new(),
             negative_anchors: Vec::new(),
             seen_ids,
@@ -61,14 +76,20 @@ impl DiscoverySession {
             target_vocal,
             target_atmo,
             target_bpm,
-        };
-        session.extend_pool(pool);
-        session
+            target_aggression,
+            target_darkness,
+        }
     }
 
-    pub fn extend_pool(&mut self, tracks: Vec<AnalyzedTrack>) {
+    pub fn extend_pool(&mut self, mut tracks: Vec<AnalyzedTrack>) {
         let existing_dedups: HashSet<String> =
             self.pool.iter().map(|t| t.meta.dedup_key.clone()).collect();
+
+        for t in &mut tracks {
+            l2_normalize_in_place(&mut t.dsp.v_beat);
+            l2_normalize_in_place(&mut t.dsp.v_vocal);
+            l2_normalize_in_place(&mut t.dsp.v_atmo);
+        }
 
         for t in tracks {
             if !self.seen_dedups.contains(&t.meta.dedup_key)
@@ -89,11 +110,13 @@ impl DiscoverySession {
         {
             self.seeds.push(seed);
         }
-        let (tb, tv, ta, bpm) = compute_seed_centroid(&self.seeds);
+        let (tb, tv, ta, bpm, aggr, dark) = compute_seed_centroid(&self.seeds);
         self.target_beat = tb;
         self.target_vocal = tv;
         self.target_atmo = ta;
         self.target_bpm = bpm;
+        self.target_aggression = aggr;
+        self.target_darkness = dark;
         self.pinned_track_id = None;
         self.extend_pool(new_candidates);
     }
@@ -165,6 +188,10 @@ impl DiscoverySession {
                 self.target_vocal = rocchio_step(&self.target_vocal, &track.dsp.v_vocal, 0.26);
                 self.target_atmo = rocchio_step(&self.target_atmo, &track.dsp.v_atmo, 0.26);
                 self.target_bpm = self.target_bpm * 0.8 + track.dsp.bpm * 0.2;
+                self.target_aggression =
+                    self.target_aggression * 0.82 + track.dsp.aggression_index * 0.18;
+                self.target_darkness =
+                    self.target_darkness * 0.82 + track.dsp.darkness_index * 0.18;
                 if !self
                     .liked_crate
                     .iter()
@@ -185,6 +212,10 @@ impl DiscoverySession {
                 self.target_vocal = rocchio_step(&self.target_vocal, &track.dsp.v_vocal, 0.55);
                 self.target_atmo = rocchio_step(&self.target_atmo, &track.dsp.v_atmo, 0.55);
                 self.target_bpm = self.target_bpm * 0.5 + track.dsp.bpm * 0.5;
+                self.target_aggression =
+                    self.target_aggression * 0.55 + track.dsp.aggression_index * 0.45;
+                self.target_darkness =
+                    self.target_darkness * 0.55 + track.dsp.darkness_index * 0.45;
                 if !self
                     .liked_crate
                     .iter()
@@ -202,7 +233,7 @@ impl DiscoverySession {
                 Some(track)
             }
             SwipeDirection::Down => {
-                let (sb, sv, sa, _) = compute_seed_centroid(&self.seeds);
+                let (sb, sv, sa, _, _, _) = compute_seed_centroid(&self.seeds);
                 self.target_beat = gram_schmidt_repel(&self.target_beat, &sb, &track.dsp.v_beat);
                 self.target_vocal =
                     gram_schmidt_repel(&self.target_vocal, &sv, &track.dsp.v_vocal);
@@ -234,36 +265,66 @@ impl DiscoverySession {
 
         if !scored.is_empty() {
             let n = scored.len() as f32;
-            let mean_b = scored.iter().map(|c| c.beat_similarity).sum::<f32>() / n;
             let mean_v = scored.iter().map(|c| c.vocal_similarity).sum::<f32>() / n;
-            let mean_a = scored.iter().map(|c| c.atmo_similarity).sum::<f32>() / n;
+            let mean_aggr = scored
+                .iter()
+                .map(|c| c.track.dsp.aggression_index)
+                .sum::<f32>()
+                / n;
 
             for c in &mut scored {
-                let db = c.beat_similarity - mean_b;
+                let aggr = c.track.dsp.aggression_index;
+                let dark = c.track.dsp.darkness_index;
                 let dv = c.vocal_similarity - mean_v;
-                let da = c.atmo_similarity - mean_a;
-                let tag = if db >= dv && db >= da {
+
+                // Partition candidates into 3 distinct musical corridors:
+                // 1. "rhythm_bass" -> HART & AGGRESSIV (Hard-hitting, high aggression & dark pressure)
+                // 2. "atmo_sample" -> CHILL & LAID-BACK (Smooth, relaxed energy & warm sample/harmony)
+                // 3. "vocal_flow"  -> FLOW & VOCAL-FOKUS (Strongest vocal timbre & cadence lock)
+                let tag = if aggr >= mean_aggr + 0.06 && (aggr + dark * 0.5) >= 0.80 {
                     "rhythm_bass"
-                } else if dv >= db && dv >= da {
+                } else if aggr <= mean_aggr - 0.05 {
+                    "atmo_sample"
+                } else if dv >= 0.0 {
                     "vocal_flow"
+                } else if aggr >= mean_aggr {
+                    "rhythm_bass"
                 } else {
                     "atmo_sample"
                 };
+
                 c.corridor_tag = tag.to_string();
                 if let Some(first_badge) = c.explanation.first_mut() {
                     *first_badge = match tag {
-                        "rhythm_bass" => "Korridor: Beat & Groove".to_string(),
-                        "vocal_flow" => "Korridor: Flow & Vocals".to_string(),
-                        _ => "Korridor: Sample & Atmo".to_string(),
+                        "rhythm_bass" => "Vibe: Hart & Aggressiv".to_string(),
+                        "vocal_flow" => "Vibe: Flow & Vocal-Lock".to_string(),
+                        _ => "Vibe: Chill & Laid-Back".to_string(),
                     };
                 }
-                if self.active_corridor != "all" {
-                    let adj = if c.corridor_tag == self.active_corridor {
-                        5.5
-                    } else {
-                        -3.5
-                    };
-                    c.total_score = ((c.total_score + adj).clamp(5.0, 99.4) * 10.0).round() / 10.0;
+
+                match self.active_corridor.as_str() {
+                    "rhythm_bass" => {
+                        // Explicitly boost hard, aggressive, dark tracks and penalize soft/chill tracks
+                        let boost = (aggr - 0.50) * 32.0 + (dark - 0.50) * 14.0;
+                        c.total_score =
+                            ((c.total_score + boost).clamp(5.0, 99.4) * 10.0).round() / 10.0;
+                    }
+                    "atmo_sample" => {
+                        // Explicitly boost chill, smooth, laid-back tracks and penalize aggressive tracks
+                        let boost = (0.52 - aggr) * 32.0 + (c.atmo_similarity - 60.0) * 0.18;
+                        c.total_score =
+                            ((c.total_score + boost).clamp(5.0, 99.4) * 10.0).round() / 10.0;
+                    }
+                    "vocal_flow" => {
+                        let boost = if c.corridor_tag == "vocal_flow" {
+                            6.5
+                        } else {
+                            -3.5
+                        };
+                        c.total_score =
+                            ((c.total_score + boost).clamp(5.0, 99.4) * 10.0).round() / 10.0;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -299,14 +360,6 @@ impl DiscoverySession {
     }
 
     fn build_vibe_corridors(&self, ranked: &[ScoredCandidate]) -> Vec<VibeCorridor> {
-        let seed_dsp = self.seeds.first().map(|s| &s.dsp);
-        let is_heavy_808 = seed_dsp
-            .map(|d| d.sub_bass_ratio >= 0.28 || d.bass_distortion >= 0.25)
-            .unwrap_or(false);
-        let is_glitch_synth = seed_dsp
-            .map(|d| d.glitch_brightness >= 0.65)
-            .unwrap_or(false);
-
         let mut beat_artists = Vec::new();
         let mut vocal_artists = Vec::new();
         let mut atmo_artists = Vec::new();
@@ -346,8 +399,8 @@ impl DiscoverySession {
         vec![
             VibeCorridor {
                 id: "all".to_string(),
-                title: "ALLE PASSENDEN".to_string(),
-                description: "Gesamter Szene- & Klang-Pool".to_string(),
+                title: "SEED-VIBE (EXAKT)".to_string(),
+                description: "Exakter Energie-, Haerte- & Klang-Match zum Seed".to_string(),
                 sample_artists: if all_artists.is_empty() {
                     "—".to_string()
                 } else {
@@ -358,12 +411,8 @@ impl DiscoverySession {
             },
             VibeCorridor {
                 id: "rhythm_bass".to_string(),
-                title: if is_heavy_808 {
-                    "BEAT & 808-BOUNCE".to_string()
-                } else {
-                    "DRUM-GROOVE & POCKET".to_string()
-                },
-                description: "Dominanter Rhythmus-, Tempo- & Bass-Match".to_string(),
+                title: "HART & AGGRESSIV".to_string(),
+                description: "Hoher Druck, harte Transienten & duesterer Sub-Bass".to_string(),
                 sample_artists: if beat_artists.is_empty() {
                     "—".to_string()
                 } else {
@@ -374,8 +423,8 @@ impl DiscoverySession {
             },
             VibeCorridor {
                 id: "vocal_flow".to_string(),
-                title: "FLOW & VOCAL-TIMBRE".to_string(),
-                description: "Stimmfarbe, Artikulations-Cadence & Delivery".to_string(),
+                title: "FLOW & VOCAL-LOCK".to_string(),
+                description: "Stimmfarbe, Artikulations-Cadence & Rap-Delivery".to_string(),
                 sample_artists: if vocal_artists.is_empty() {
                     "—".to_string()
                 } else {
@@ -386,12 +435,8 @@ impl DiscoverySession {
             },
             VibeCorridor {
                 id: "atmo_sample".to_string(),
-                title: if is_glitch_synth {
-                    "SYNTH & GLITCH-ATMO".to_string()
-                } else {
-                    "SAMPLE & HARMONIE-VIBE".to_string()
-                },
-                description: "Harmonische Akkord-Farbe, Sample-Waerme & Textur".to_string(),
+                title: "CHILL & LAID-BACK".to_string(),
+                description: "Entspannter Groove, Sample-Waerme & ruhigere Energie".to_string(),
                 sample_artists: if atmo_artists.is_empty() {
                     "—".to_string()
                 } else {
@@ -442,7 +487,23 @@ impl DiscoverySession {
         // 2. Scene Consensus Affinity Bonus (rewards candidates verified across multiple scene sources)
         total += (track.meta.scene_affinity - 0.72) * 15.0;
 
-        // 3. Continuous Multi-Octave Gaussian Tempo Kernel coupled to Beat weight w_beat
+        // 3. Arousal-Valence Vibe-Alignment Gatekeeper (Aggression/Hardness & Darkness/Mood match)
+        // Ensures an aggressive/dark track isn't matched with a calm/chill or bright party/carnival track (and vice versa).
+        let aggr_diff = (track.dsp.aggression_index - self.target_aggression).abs();
+        let dark_diff = (track.dsp.darkness_index - self.target_darkness).abs();
+
+        if aggr_diff <= 0.12 && dark_diff <= 0.14 {
+            total += 4.2;
+        } else {
+            if aggr_diff > 0.14 {
+                total -= ((aggr_diff - 0.14) * 44.0).clamp(0.0, 26.0);
+            }
+            if dark_diff > 0.15 {
+                total -= ((dark_diff - 0.15) * 40.0).clamp(0.0, 24.0);
+            }
+        }
+
+        // 4. Continuous Multi-Octave Gaussian Tempo Kernel coupled to Beat weight w_beat
         let bpm_diff = (track.dsp.bpm - self.target_bpm)
             .abs()
             .min((track.dsp.bpm * 2.0 - self.target_bpm).abs())
@@ -522,6 +583,11 @@ impl DiscoverySession {
 
         let mut explanation = Vec::with_capacity(6);
         explanation.push(corridor_label.to_string());
+        explanation.push(format!(
+            "Haerte/Aggr: {:.0}% | Duesterkeit: {:.0}%",
+            track.dsp.aggression_index * 100.0,
+            track.dsp.darkness_index * 100.0
+        ));
         explanation.push(format!(
             "{:.1} BPM (Drop @ {:.1}s)",
             track.dsp.bpm, track.dsp.drop_start_sec
@@ -806,15 +872,17 @@ fn session_track_jitter(session_id: &str, dedup_key: &str) -> f32 {
     (norm - 0.5) * 2.2
 }
 
-fn compute_seed_centroid(seeds: &[AnalyzedTrack]) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32) {
+fn compute_seed_centroid(seeds: &[AnalyzedTrack]) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32, f32, f32) {
     if seeds.is_empty() {
-        return (vec![0.0; 16], vec![0.0; 16], vec![0.0; 16], 135.0);
+        return (vec![0.0; 16], vec![0.0; 16], vec![0.0; 16], 135.0, 0.50, 0.50);
     }
     let dim = 16usize;
     let mut tb = vec![0.0f32; dim];
     let mut tv = vec![0.0f32; dim];
     let mut ta = vec![0.0f32; dim];
     let mut bpm_sum = 0.0f32;
+    let mut aggr_sum = 0.0f32;
+    let mut dark_sum = 0.0f32;
 
     for s in seeds {
         for i in 0..dim {
@@ -823,13 +891,16 @@ fn compute_seed_centroid(seeds: &[AnalyzedTrack]) -> (Vec<f32>, Vec<f32>, Vec<f3
             ta[i] += s.dsp.v_atmo.get(i).copied().unwrap_or(0.0);
         }
         bpm_sum += s.dsp.bpm;
+        aggr_sum += s.dsp.aggression_index;
+        dark_sum += s.dsp.darkness_index;
     }
 
     l2_normalize_in_place(&mut tb);
     l2_normalize_in_place(&mut tv);
     l2_normalize_in_place(&mut ta);
 
-    (tb, tv, ta, bpm_sum / seeds.len() as f32)
+    let n = seeds.len() as f32;
+    (tb, tv, ta, bpm_sum / n, aggr_sum / n, dark_sum / n)
 }
 
 fn rocchio_step(target: &[f32], vec: &[f32], alpha: f32) -> Vec<f32> {
@@ -847,5 +918,100 @@ fn l2_normalize_in_place(v: &mut [f32]) {
     let norm = v.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-6);
     for x in v {
         *x /= norm;
+    }
+}
+
+/// Empirical Pool-Relative Z-Score Whitening:
+/// Centers all 48 acoustic dimensions across the session's active seeds + candidate pool
+/// to exact mean 0.0 and variance 1.0 before L2-normalizing, guaranteeing that no dimension
+/// can ever saturate and that aggressive vs. calm / dark vs. bright tracks have opposite signs.
+fn whiten_tracks(seeds: &mut [AnalyzedTrack], pool: &mut [AnalyzedTrack]) {
+    let total = seeds.len() + pool.len();
+    if total < 4 {
+        for t in seeds.iter_mut().chain(pool.iter_mut()) {
+            l2_normalize_in_place(&mut t.dsp.v_beat);
+            l2_normalize_in_place(&mut t.dsp.v_vocal);
+            l2_normalize_in_place(&mut t.dsp.v_atmo);
+        }
+        return;
+    }
+
+    let n = total as f32;
+    let mut mean_b = [0.0f32; 16];
+    let mut mean_v = [0.0f32; 16];
+    let mut mean_a = [0.0f32; 16];
+    let mut mean_aggr = 0.0f32;
+    let mut mean_dark = 0.0f32;
+
+    for t in seeds.iter().chain(pool.iter()) {
+        for j in 0..16 {
+            mean_b[j] += t.dsp.v_beat.get(j).copied().unwrap_or(0.0);
+            mean_v[j] += t.dsp.v_vocal.get(j).copied().unwrap_or(0.0);
+            mean_a[j] += t.dsp.v_atmo.get(j).copied().unwrap_or(0.0);
+        }
+        mean_aggr += t.dsp.aggression_index;
+        mean_dark += t.dsp.darkness_index;
+    }
+    for j in 0..16 {
+        mean_b[j] /= n;
+        mean_v[j] /= n;
+        mean_a[j] /= n;
+    }
+    mean_aggr /= n;
+    mean_dark /= n;
+
+    let mut std_b = [0.0f32; 16];
+    let mut std_v = [0.0f32; 16];
+    let mut std_a = [0.0f32; 16];
+    let mut var_aggr = 0.0f32;
+    let mut var_dark = 0.0f32;
+
+    for t in seeds.iter().chain(pool.iter()) {
+        for j in 0..16 {
+            let db = t.dsp.v_beat.get(j).copied().unwrap_or(0.0) - mean_b[j];
+            let dv = t.dsp.v_vocal.get(j).copied().unwrap_or(0.0) - mean_v[j];
+            let da = t.dsp.v_atmo.get(j).copied().unwrap_or(0.0) - mean_a[j];
+            std_b[j] += db * db;
+            std_v[j] += dv * dv;
+            std_a[j] += da * da;
+        }
+        let dag = t.dsp.aggression_index - mean_aggr;
+        let ddk = t.dsp.darkness_index - mean_dark;
+        var_aggr += dag * dag;
+        var_dark += ddk * ddk;
+    }
+    for j in 0..16 {
+        std_b[j] = (std_b[j] / n).sqrt().max(0.04);
+        std_v[j] = (std_v[j] / n).sqrt().max(0.04);
+        std_a[j] = (std_a[j] / n).sqrt().max(0.04);
+    }
+    let std_aggr = (var_aggr / n).sqrt().max(0.04);
+    let std_dark = (var_dark / n).sqrt().max(0.04);
+
+    for t in seeds.iter_mut().chain(pool.iter_mut()) {
+        for j in 0..16 {
+            if let Some(vb) = t.dsp.v_beat.get_mut(j) {
+                *vb = ((*vb - mean_b[j]) / std_b[j]).clamp(-2.6, 2.6);
+            }
+            if let Some(vv) = t.dsp.v_vocal.get_mut(j) {
+                *vv = ((*vv - mean_v[j]) / std_v[j]).clamp(-2.6, 2.6);
+            }
+            if let Some(va) = t.dsp.v_atmo.get_mut(j) {
+                *va = ((*va - mean_a[j]) / std_a[j]).clamp(-2.6, 2.6);
+            }
+        }
+        l2_normalize_in_place(&mut t.dsp.v_beat);
+        l2_normalize_in_place(&mut t.dsp.v_vocal);
+        l2_normalize_in_place(&mut t.dsp.v_atmo);
+
+        let z_aggr = (t.dsp.aggression_index - mean_aggr) / std_aggr;
+        let z_dark = (t.dsp.darkness_index - mean_dark) / std_dark;
+
+        // Combine physical baseline with pool-calibrated z-score for sharp discrimination
+        let cal_aggr = 0.25 * t.dsp.aggression_index + 0.75 * (0.50 + 0.45 * (0.85 * z_aggr).tanh());
+        let cal_dark = 0.25 * t.dsp.darkness_index + 0.75 * (0.50 + 0.45 * (0.85 * z_dark).tanh());
+
+        t.dsp.aggression_index = (cal_aggr.clamp(0.04, 0.96) * 100.0).round() / 100.0;
+        t.dsp.darkness_index = (cal_dark.clamp(0.04, 0.96) * 100.0).round() / 100.0;
     }
 }

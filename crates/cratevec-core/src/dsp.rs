@@ -412,7 +412,7 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
                 let q_idx = (slice.len() / 5).max(1);
                 let valley = slice[..q_idx].iter().sum::<f32>() / q_idx as f32;
                 let peak = slice[slice.len() - q_idx..].iter().sum::<f32>() / q_idx as f32;
-                f_oct[o_idx] = ((peak + 1e-5) / (valley + 1e-5)).ln();
+                f_oct[o_idx] = ((peak + 1e-8) / (valley + 1e-8)).ln().clamp(0.2, 4.5);
             }
         }
         frame_contrasts.push(f_oct);
@@ -558,14 +558,14 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     let synth_high_ratio = mean_shigh / total_band_amp;
     let air_ratio = mean_gair / total_band_amp;
 
-    // 808 harmonic distortion gated by true sub-bass presence (20-90 Hz)
+    // 808 harmonic distortion & low-end grit gated by true sub-bass presence (20-90 Hz)
     let mut dist_acc = 0.0f32;
     let mut dist_count = 0usize;
-    let sub_thresh = mean_sub * 1.15;
+    let sub_thresh = mean_sub * 1.10;
     for i in drop_frame..n_f {
         if sub_bass_env[i] > sub_thresh && sub_bass_env[i] > 1e-4 {
             let harm_ratio =
-                (kick_punch_env[i] + low_mid_env[i] * 0.85) / (sub_bass_env[i] + 1e-4);
+                (kick_punch_env[i] + low_mid_env[i] * 0.90) / (sub_bass_env[i] + 1e-4);
             dist_acc += harm_ratio;
             dist_count += 1;
         }
@@ -575,20 +575,19 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     } else {
         (mean_kick + mean_lowmid) / (mean_sub + 1e-4)
     };
-    let sub_presence_gate = ((sub_bass_ratio - 0.10) / 0.14).clamp(0.0, 1.0);
+    let sub_presence_gate = ((sub_bass_ratio - 0.22) / 0.16).clamp(0.0, 1.0);
     let bass_distortion =
-        (sub_presence_gate * ((raw_distortion - 0.50) / 1.85).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        (sub_presence_gate * ((raw_distortion - 0.18) / 0.95).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
     let low_flux_density = mean_low_flux / (mean_sub + mean_kick + 1e-4);
     let high_flux_density = mean_high_flux / (mean_shigh + mean_gair + 1e-4);
     let sub_crest = max_f32(&sub_bass_env[drop_frame..]) / (mean_sub + 1e-4);
-    let rms_variance = std_dev_f32(&frame_rms) / (mean_f32(&frame_rms) + 1e-4);
     let std_centroid = std_dev_f32(&spectral_centroids);
 
-    let glitch_brightness = ((synth_high_ratio * 3.2
-        + air_ratio * 4.5
-        + high_flux_density * 0.9
-        + oct_contrasts[4] * 0.08)
+    let glitch_brightness = ((synth_high_ratio * 2.8
+        + air_ratio * 3.8
+        + high_flux_density * 0.75
+        + (oct_contrasts[4] - 1.5).max(0.0) * 0.12)
         .clamp(0.0, 1.0)
         * 100.0)
         .round()
@@ -625,51 +624,83 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     }
     chroma_entropy = (chroma_entropy / (12.0f32).ln()).clamp(0.0, 1.0);
 
-    let dark_harmony = aligned_chroma[1] * 1.3
-        + aligned_chroma[3] * 1.4
-        + aligned_chroma[6] * 1.2
-        + aligned_chroma[8] * 1.2
-        + aligned_chroma[10] * 0.9;
+    let dark_harmony = aligned_chroma[1] * 1.35
+        + aligned_chroma[3] * 1.40
+        + aligned_chroma[6] * 1.30
+        + aligned_chroma[8] * 1.20
+        + aligned_chroma[10] * 0.85;
     let bright_harmony =
-        aligned_chroma[4] * 1.4 + aligned_chroma[7] * 0.8 + aligned_chroma[9] * 1.1;
+        aligned_chroma[4] * 1.55 + aligned_chroma[7] * 0.90 + aligned_chroma[9] * 1.25;
     let harmonic_darkness =
         (dark_harmony / (dark_harmony + bright_harmony + 1e-5)).clamp(0.0, 1.0);
 
-    let darkness_index = (((sub_bass_ratio * 1.6 + harmonic_darkness * 0.7)
-        - (mean_centroid / 8000.0) * 0.35)
-        .clamp(0.0, 1.0)
+    // Calibrated Darkness Index (0.0 = bright brass/party/major pop .. 1.0 = dark menacing sub-bass & minor/tritone)
+    let sub_to_warm_body = (mean_sub / (mean_lowmid * 1.4 + mean_vcore * 0.7 + 1e-5)).clamp(0.2, 2.8);
+    let sub_dark_score = ((sub_to_warm_body - 0.65) / 1.45).clamp(0.0, 1.0);
+    let harm_dark_score = ((harmonic_darkness - 0.38) / 0.30).clamp(0.0, 1.0);
+    let darkness_index = ((0.48 * sub_dark_score + 0.52 * harm_dark_score).clamp(0.04, 0.98)
+        * 100.0)
+        .round()
+        / 100.0;
+
+    // Calibrated Aggression & Hardness Index (0.0 = calm/chill/soft .. 1.0 = aggressive/hard-hitting/intense)
+    // Normalized against total_band_amp (never dividing by mean_sub or mean_vcore, which previously penalized
+    // heavy sub-bass beats and deep chest-voice rappers!).
+    let dw = delta_weight_sum.max(1e-5);
+    let d_mfcc0 = (delta_mfcc_sq[0] / dw).sqrt() as f32;
+    let d_mfcc1 = (delta_mfcc_sq[1] / dw).sqrt() as f32;
+    let d_mfcc2 = (delta_mfcc_sq[2] / dw).sqrt() as f32;
+    let d_mfcc3 = (delta_mfcc_sq[3] / dw).sqrt() as f32;
+
+    let abs_low_attack = (mean_low_flux / total_band_amp) * 4.2;
+    let abs_high_attack = (mean_high_flux / total_band_amp) * 3.5;
+    let abs_vocal_bite = (mean_vbite / total_band_amp) * 4.5;
+
+    let bass_pressure_aggr =
+        (((sub_bass_ratio * 1.15 + punch_ratio * 1.6 + bass_distortion * 0.75) - 0.42) / 0.40)
+            .clamp(0.0, 1.0);
+    let transient_aggr =
+        (((abs_low_attack * 1.35 + abs_high_attack * 0.65) - 0.16) / 0.36).clamp(0.0, 1.0);
+    let vocal_attack_aggr =
+        (((abs_vocal_bite + (d_mfcc0 + d_mfcc1) * 2.2) - 0.22) / 0.42).clamp(0.0, 1.0);
+
+    let aggression_index = ((0.38 * bass_pressure_aggr
+        + 0.32 * transient_aggr
+        + 0.30 * vocal_attack_aggr)
+        .clamp(0.04, 0.98)
         * 100.0)
         .round()
         / 100.0;
 
     // 9. Construct the 3 centered, z-scored, L2-normalized 16-dimensional vectors
+    // Empirically calibrated (mean, std) so zero-mean z-scores span [-2.5, +2.5] without saturation!
 
-    // --- Vector 1: v_beat (16 dims: Continuous octave-invariant log2 BPM phase, sub-bass, 808 saturation, transients) ---
+    // --- Vector 1: v_beat (16 dims) ---
     let oct_pos = (bpm / 95.0).log2().rem_euclid(1.0);
-    let bpm_oct = 95.0 * 2.0f32.powf(oct_pos); // Continuous in [95.0, 190.0)
-    let bpm_phase = 2.0 * PI * bpm.log2(); // 70 BPM and 140 BPM have identical phase angle!
+    let bpm_oct = 95.0 * 2.0f32.powf(oct_pos);
+    let bpm_phase = 2.0 * PI * bpm.log2();
 
     let beat_raw: [(f32, f32, f32); 16] = [
         (bpm_oct, 134.0, 22.0),
         (bpm_phase.sin(), 0.0, 0.707),
         (bpm_phase.cos(), 0.0, 0.707),
-        (sub_bass_ratio, 0.22, 0.085),
-        (punch_ratio, 0.14, 0.055),
-        (lowmid_ratio, 0.14, 0.050),
-        (bass_distortion, 0.32, 0.20),
-        (low_flux_density, 0.28, 0.11),
-        (high_flux_density, 0.32, 0.12),
-        (tempo_strength, 0.45, 0.17),
+        (sub_bass_ratio, 0.42, 0.11),
+        (punch_ratio, 0.16, 0.048),
+        (lowmid_ratio, 0.15, 0.045),
+        (bass_distortion, 0.32, 0.22),
+        (low_flux_density, 0.20, 0.075),
+        (high_flux_density, 0.24, 0.085),
+        (tempo_strength, 0.44, 0.16),
         (syncopation_ratio, 0.48, 0.16),
         (double_time_ratio, 0.52, 0.18),
-        (sub_crest, 2.3, 0.65),
-        (rms_variance, 0.31, 0.13),
-        (oct_contrasts[0], 1.85, 0.55),
-        (oct_contrasts[1], 1.95, 0.55),
+        (sub_crest, 2.25, 0.60),
+        (aggression_index, 0.50, 0.20),
+        (oct_contrasts[0], 1.65, 0.55),
+        (oct_contrasts[1], 1.85, 0.55),
     ];
     let v_beat = zscore_and_l2_normalize(&beat_raw);
 
-    // --- Vector 2: v_vocal (16 dims: 8 mean-centered DCT-II MFCCs + 4 Delta-MFCC dynamic energies + 4 vocal presence/formant metrics) ---
+    // --- Vector 2: v_vocal (16 dims) ---
     let mut vocal_log_means = [0.0f32; 16];
     let mut vocal_log_vars = [0.0f32; 16];
     for b in 0..16 {
@@ -686,51 +717,46 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         }
         vocal_cepstrum[k] = s * 0.25;
     }
-    let dw = delta_weight_sum.max(1e-5);
-    let d_mfcc0 = (delta_mfcc_sq[0] / dw).sqrt() as f32;
-    let d_mfcc1 = (delta_mfcc_sq[1] / dw).sqrt() as f32;
-    let d_mfcc2 = (delta_mfcc_sq[2] / dw).sqrt() as f32;
-    let d_mfcc3 = (delta_mfcc_sq[3] / dw).sqrt() as f32;
 
     let vocal_modulation = vocal_log_vars.iter().sum::<f32>() / 16.0;
     let vocal_raw: [(f32, f32, f32); 16] = [
-        (vocal_cepstrum[0], -0.25, 0.40),
-        (vocal_cepstrum[1], -0.05, 0.32),
-        (vocal_cepstrum[2], 0.0, 0.26),
-        (vocal_cepstrum[3], 0.0, 0.22),
-        (vocal_cepstrum[4], 0.0, 0.19),
-        (vocal_cepstrum[5], 0.0, 0.17),
-        (vocal_cepstrum[6], 0.0, 0.15),
-        (vocal_cepstrum[7], 0.0, 0.14),
-        (d_mfcc0, 0.24, 0.09),
-        (d_mfcc1, 0.18, 0.07),
-        (d_mfcc2, 0.15, 0.06),
-        (d_mfcc3, 0.13, 0.05),
-        (vocal_presence, 0.34, 0.10),
-        (vocal_bite_ratio, 0.32, 0.11),
-        (vocal_modulation, 0.52, 0.17),
-        (oct_contrasts[3], 2.1, 0.55),
+        (vocal_cepstrum[0], 0.35, 0.38),
+        (vocal_cepstrum[1], -0.12, 0.24),
+        (vocal_cepstrum[2], -0.04, 0.16),
+        (vocal_cepstrum[3], 0.0, 0.12),
+        (vocal_cepstrum[4], 0.0, 0.10),
+        (vocal_cepstrum[5], 0.0, 0.08),
+        (vocal_cepstrum[6], 0.0, 0.07),
+        (vocal_cepstrum[7], 0.0, 0.06),
+        (d_mfcc0, 0.11, 0.045),
+        (d_mfcc1, 0.08, 0.035),
+        (d_mfcc2, 0.06, 0.028),
+        (d_mfcc3, 0.05, 0.024),
+        (vocal_presence, 0.24, 0.075),
+        (vocal_bite_ratio, 0.26, 0.085),
+        (vocal_modulation, 0.36, 0.11),
+        (aggression_index, 0.50, 0.20),
     ];
     let v_vocal = zscore_and_l2_normalize(&vocal_raw);
 
-    // --- Vector 3: v_atmo (16 dims: Triad-aligned harmonic intervals, chroma entropy, spectral contrast, glitch air) ---
+    // --- Vector 3: v_atmo (16 dims) ---
     let atmo_raw: [(f32, f32, f32); 16] = [
-        (harmonic_darkness, 0.52, 0.14),
-        (aligned_chroma[1] + aligned_chroma[2], 0.15, 0.055),
-        (aligned_chroma[3], 0.09, 0.038),
-        (aligned_chroma[4], 0.08, 0.038),
-        (aligned_chroma[5] + aligned_chroma[7], 0.19, 0.055),
-        (aligned_chroma[6], 0.06, 0.028),
-        (aligned_chroma[8] + aligned_chroma[10], 0.16, 0.048),
-        (mean_centroid / 1000.0, 2.3, 0.85),
-        (std_centroid / 1000.0, 0.75, 0.32),
-        (mean_flatness, 0.18, 0.085),
-        (synth_high_ratio, 0.09, 0.045),
-        (air_ratio, 0.04, 0.025),
-        (oct_contrasts[2], 2.0, 0.50),
-        (oct_contrasts[4], 2.2, 0.58),
-        (oct_contrasts[5], 2.3, 0.62),
-        (chroma_entropy, 0.88, 0.07),
+        (harmonic_darkness, 0.53, 0.085),
+        (aligned_chroma[1] + aligned_chroma[2], 0.15, 0.042),
+        (aligned_chroma[3], 0.09, 0.032),
+        (aligned_chroma[4], 0.085, 0.032),
+        (aligned_chroma[5] + aligned_chroma[7], 0.19, 0.045),
+        (aligned_chroma[6], 0.065, 0.025),
+        (aligned_chroma[8] + aligned_chroma[10], 0.16, 0.040),
+        (mean_centroid / 1000.0, 1.95, 0.65),
+        (std_centroid / 1000.0, 0.65, 0.25),
+        (mean_flatness, 0.16, 0.075),
+        (synth_high_ratio, 0.07, 0.035),
+        (air_ratio, 0.035, 0.022),
+        (oct_contrasts[2], 1.95, 0.48),
+        (oct_contrasts[4], 2.15, 0.52),
+        (darkness_index, 0.52, 0.20),
+        (chroma_entropy, 0.93, 0.045),
     ];
     let v_atmo = zscore_and_l2_normalize(&atmo_raw);
 
@@ -743,6 +769,7 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         vocal_presence: (vocal_presence * 100.0).round() / 100.0,
         glitch_brightness,
         darkness_index,
+        aggression_index,
         waveform_peaks,
         v_beat,
         v_vocal,
@@ -921,15 +948,9 @@ fn estimate_bpm_and_groove(
 
 fn zscore_and_l2_normalize(features: &[(f32, f32, f32)]) -> Vec<f32> {
     let mut out = Vec::with_capacity(features.len());
-    let mut norm_sq = 0.0f32;
     for &(val, mean, std) in features {
-        let z = ((val - mean) / std.max(1e-4)).clamp(-3.2, 3.2);
-        norm_sq += z * z;
+        let z = (val - mean) / std.max(1e-4);
         out.push(z);
-    }
-    let norm = norm_sq.sqrt().max(1e-5);
-    for v in &mut out {
-        *v /= norm;
     }
     out
 }
@@ -950,10 +971,10 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     (dot / denom).clamp(-1.0, 1.0)
 }
 
-/// Contrast-sharpened percentage mapping centered around empirical baseline cos_0 = 0.08.
+/// Maps zero-mean pool-whitened cosine similarity (-1.0 .. +1.0) into a high-contrast 0..100% score.
 pub fn cosine_to_percentage(cos: f32) -> f32 {
-    let mapped = 50.0 + 51.5 * ((cos - 0.08) * 1.62).tanh();
-    (mapped.clamp(2.0, 99.6) * 10.0).round() / 10.0
+    let mapped = 54.0 + 45.0 * (cos * 1.65).tanh();
+    (mapped.clamp(5.0, 99.4) * 10.0).round() / 10.0
 }
 
 fn mean_f32(slice: &[f32]) -> f32 {

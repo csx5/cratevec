@@ -379,7 +379,7 @@
         <img src="${escapeHtml(s.meta.cover_url)}" alt="">
         <div class="seed-info">
           <div class="seed-title">${escapeHtml(s.meta.artist)} - ${escapeHtml(s.meta.title)}</div>
-          <div class="seed-sub">${s.dsp.bpm.toFixed(0)} BPM | Drop @ ${s.dsp.drop_start_sec.toFixed(1)}s | 808: ${(s.dsp.bass_distortion * 100).toFixed(0)}%</div>
+          <div class="seed-sub">${s.dsp.bpm.toFixed(0)} BPM | Drop @ ${s.dsp.drop_start_sec.toFixed(1)}s | Haerte: ${((s.dsp.aggression_index || 0.5) * 100).toFixed(0)}% | Dark: ${(s.dsp.darkness_index * 100).toFixed(0)}%</div>
         </div>
       </div>
     `
