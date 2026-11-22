@@ -461,9 +461,80 @@ input[type="range"] {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: 18px;
+  justify-content: flex-start;
+  padding: 14px 18px;
+  gap: 12px;
   overflow-y: auto;
+}
+
+/* VIBE-CORRIDOR SELECTOR BAR */
+.corridor-bar {
+  width: 100%;
+  max-width: 650px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.corridor-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 9px;
+  background: var(--bg-pane);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--border);
+  border-radius: 2px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.1s, background 0.1s;
+}
+
+.corridor-chip:hover {
+  background: #1b1d23;
+  border-color: var(--border-focus);
+}
+
+.corridor-chip.active {
+  background: var(--bg-card);
+  border-color: var(--accent-amber);
+  border-top: 2px solid var(--accent-amber);
+}
+
+.corridor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.corridor-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.corridor-chip.active .corridor-title {
+  color: var(--accent-amber);
+}
+
+.corridor-count {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.corridor-artists {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .hidden {

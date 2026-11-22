@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "cratevec-cli"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cratevec-core",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "cratevec-core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "cratevec-server"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -46,6 +46,11 @@ struct FocusRequest {
 }
 
 #[derive(Deserialize)]
+struct CorridorRequest {
+    corridor_id: String,
+}
+
+#[derive(Deserialize)]
 struct AudioProxyQuery {
     #[serde(default)]
     id: String,
@@ -102,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/session/bridge", post(api_bridge_seed))
         .route("/api/session/swipe", post(api_swipe))
         .route("/api/session/focus", post(api_focus_track))
+        .route("/api/session/corridor", post(api_select_corridor))
         .route("/api/session/weights", post(api_update_weights))
         .route("/api/session/snapshot", get(api_get_snapshot))
         .route("/api/audio/proxy", get(api_audio_proxy))
@@ -234,6 +240,22 @@ async fn api_focus_track(
     Json(req): Json<FocusRequest>,
 ) -> Response {
     match state.engine.focus_track(&req.track_id) {
+        Ok(snap) => Json(snap).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_select_corridor(
+    State(state): State<AppState>,
+    Json(req): Json<CorridorRequest>,
+) -> Response {
+    match state.engine.select_corridor(&req.corridor_id) {
         Ok(snap) => Json(snap).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

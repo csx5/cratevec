@@ -206,6 +206,21 @@
     }
   }
 
+  async function selectCorridor(corridorId) {
+    if (!corridorId || !state.snapshot) return;
+    stopAudioImmediate();
+    try {
+      const snap = await apiFetch("/api/session/corridor", {
+        method: "POST",
+        body: JSON.stringify({ corridor_id: corridorId }),
+      });
+      state.lastTrackId = null;
+      applySnapshot(snap, true);
+    } catch (err) {
+      console.error("Select corridor failed:", err);
+    }
+  }
+
   function scheduleWeightsUpdate() {
     if (state.weightTimer) clearTimeout(state.weightTimer);
     state.weightTimer = setTimeout(async () => {
@@ -304,6 +319,7 @@
     renderNegativeAnchors(snap.negative_anchors);
     renderCrate(snap.liked_crate);
     renderQueue(snap.queue_preview);
+    renderCorridors(snap.vibe_corridors);
     drawTriangleMixer();
     updateUndergroundUI();
 
@@ -318,6 +334,36 @@
     }
 
     drawSonicMap();
+  }
+
+  function renderCorridors(corridors) {
+    const bar = document.getElementById("corridor-bar");
+    if (!bar) return;
+    if (!corridors || corridors.length === 0) {
+      bar.classList.add("hidden");
+      return;
+    }
+    bar.classList.remove("hidden");
+    bar.innerHTML = corridors
+      .map(
+        (c, idx) => `
+      <button type="button" class="corridor-chip ${c.active ? "active" : ""}" data-corridor="${escapeHtml(c.id)}" title="${escapeHtml(c.description)} (Taste ${idx + 1})">
+        <div class="corridor-head">
+          <span class="corridor-title">0${idx + 1} // ${escapeHtml(c.title)}</span>
+          <span class="corridor-count">[${c.track_count}]</span>
+        </div>
+        <div class="corridor-artists">${escapeHtml(c.sample_artists)}</div>
+      </button>
+    `
+      )
+      .join("");
+
+    bar.querySelectorAll(".corridor-chip").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const cid = btn.getAttribute("data-corridor");
+        if (cid) selectCorridor(cid);
+      });
+    });
   }
 
   function renderSeeds(seeds) {
@@ -940,6 +986,13 @@
     } else if (e.key === "r" || e.key === "R") {
       e.preventDefault();
       document.getElementById("btn-jump-drop").click();
+    } else if (["1", "2", "3", "4"].includes(e.key)) {
+      const corridors = (state.snapshot && state.snapshot.vibe_corridors) || [];
+      const idx = parseInt(e.key, 10) - 1;
+      if (corridors[idx]) {
+        e.preventDefault();
+        selectCorridor(corridors[idx].id);
+      }
     }
   });
 

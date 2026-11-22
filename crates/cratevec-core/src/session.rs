@@ -3,7 +3,9 @@ use std::collections::HashSet;
 use crate::dsp::{cosine_similarity, cosine_to_percentage};
 use crate::models::{
     AnalyzedTrack, MixerWeights, ScoredCandidate, SessionSnapshot, SonicMapPoint, SwipeDirection,
+    VibeCorridor,
 };
+use crate::trainer::TrainedMetricModel;
 
 #[derive(Debug, Clone)]
 pub struct DiscoverySession {
@@ -16,7 +18,9 @@ pub struct DiscoverySession {
     pub seen_dedups: HashSet<String>,
     pub prev_session_dedups: HashSet<String>,
     pub pinned_track_id: Option<String>,
+    pub active_corridor: String,
     pub weights: MixerWeights,
+    pub metric_model: TrainedMetricModel,
     pub target_beat: Vec<f32>,
     pub target_vocal: Vec<f32>,
     pub target_atmo: Vec<f32>,
@@ -29,6 +33,7 @@ impl DiscoverySession {
         seeds: Vec<AnalyzedTrack>,
         pool: Vec<AnalyzedTrack>,
         prev_session_dedups: HashSet<String>,
+        metric_model: TrainedMetricModel,
     ) -> Self {
         let mut seen_ids = HashSet::new();
         let mut seen_dedups = HashSet::new();
@@ -49,7 +54,9 @@ impl DiscoverySession {
             seen_dedups,
             prev_session_dedups,
             pinned_track_id: None,
+            active_corridor: "all".to_string(),
             weights: MixerWeights::default(),
+            metric_model,
             target_beat,
             target_vocal,
             target_atmo,
@@ -95,6 +102,36 @@ impl DiscoverySession {
         self.weights = weights;
     }
 
+    /// Switches the active Vibe-Corridor ("all", "rhythm_bass", "vocal_flow", "atmo_sample")
+    /// and aligns the stem mixer weights and deck ordering to that sonic corridor.
+    pub fn select_corridor(&mut self, corridor_id: &str) {
+        self.active_corridor = corridor_id.to_string();
+        self.pinned_track_id = None;
+        match corridor_id {
+            "rhythm_bass" => {
+                self.weights.beat = 0.64;
+                self.weights.vocal = 0.18;
+                self.weights.atmo = 0.18;
+            }
+            "vocal_flow" => {
+                self.weights.beat = 0.20;
+                self.weights.vocal = 0.62;
+                self.weights.atmo = 0.18;
+            }
+            "atmo_sample" => {
+                self.weights.beat = 0.18;
+                self.weights.vocal = 0.20;
+                self.weights.atmo = 0.62;
+            }
+            _ => {
+                self.active_corridor = "all".to_string();
+                self.weights.beat = 0.38;
+                self.weights.vocal = 0.31;
+                self.weights.atmo = 0.31;
+            }
+        }
+    }
+
     pub fn focus_track(&mut self, track_id: &str) {
         if self.pool.iter().any(|t| t.meta.id == track_id) {
             self.pinned_track_id = Some(track_id.to_string());
@@ -113,6 +150,14 @@ impl DiscoverySession {
         if self.pinned_track_id.as_deref() == Some(track_id) {
             self.pinned_track_id = None;
         }
+
+        self.metric_model.online_update_from_swipe(
+            &self.target_beat,
+            &self.target_vocal,
+            &self.target_atmo,
+            &track,
+            direction,
+        );
 
         match direction {
             SwipeDirection::Right => {
@@ -157,16 +202,11 @@ impl DiscoverySession {
                 Some(track)
             }
             SwipeDirection::Down => {
-                // Gram-Schmidt Orthogonal Subspace Elimination:
-                // Only reject the component of `track` that deviated from the positive seed centroid,
-                // preserving shared desirable features (such as matching BPM or bass foundation).
                 let (sb, sv, sa, _) = compute_seed_centroid(&self.seeds);
-                self.target_beat =
-                    gram_schmidt_repel(&self.target_beat, &sb, &track.dsp.v_beat);
+                self.target_beat = gram_schmidt_repel(&self.target_beat, &sb, &track.dsp.v_beat);
                 self.target_vocal =
                     gram_schmidt_repel(&self.target_vocal, &sv, &track.dsp.v_vocal);
-                self.target_atmo =
-                    gram_schmidt_repel(&self.target_atmo, &sa, &track.dsp.v_atmo);
+                self.target_atmo = gram_schmidt_repel(&self.target_atmo, &sa, &track.dsp.v_atmo);
                 if !self
                     .negative_anchors
                     .iter()
@@ -192,6 +232,42 @@ impl DiscoverySession {
             .map(|track| self.score_single_candidate(track, w_beat, w_vocal, w_atmo))
             .collect();
 
+        if !scored.is_empty() {
+            let n = scored.len() as f32;
+            let mean_b = scored.iter().map(|c| c.beat_similarity).sum::<f32>() / n;
+            let mean_v = scored.iter().map(|c| c.vocal_similarity).sum::<f32>() / n;
+            let mean_a = scored.iter().map(|c| c.atmo_similarity).sum::<f32>() / n;
+
+            for c in &mut scored {
+                let db = c.beat_similarity - mean_b;
+                let dv = c.vocal_similarity - mean_v;
+                let da = c.atmo_similarity - mean_a;
+                let tag = if db >= dv && db >= da {
+                    "rhythm_bass"
+                } else if dv >= db && dv >= da {
+                    "vocal_flow"
+                } else {
+                    "atmo_sample"
+                };
+                c.corridor_tag = tag.to_string();
+                if let Some(first_badge) = c.explanation.first_mut() {
+                    *first_badge = match tag {
+                        "rhythm_bass" => "Korridor: Beat & Groove".to_string(),
+                        "vocal_flow" => "Korridor: Flow & Vocals".to_string(),
+                        _ => "Korridor: Sample & Atmo".to_string(),
+                    };
+                }
+                if self.active_corridor != "all" {
+                    let adj = if c.corridor_tag == self.active_corridor {
+                        5.5
+                    } else {
+                        -3.5
+                    };
+                    c.total_score = ((c.total_score + adj).clamp(5.0, 99.4) * 10.0).round() / 10.0;
+                }
+            }
+        }
+
         scored.sort_by(|a, b| {
             b.total_score
                 .partial_cmp(&a.total_score)
@@ -212,6 +288,121 @@ impl DiscoverySession {
         scored
     }
 
+    fn classify_corridor(&self, beat_pct: f32, vocal_pct: f32, atmo_pct: f32) -> &'static str {
+        if beat_pct >= vocal_pct + 1.2 && beat_pct >= atmo_pct - 0.5 {
+            "rhythm_bass"
+        } else if vocal_pct >= beat_pct - 0.5 && vocal_pct >= atmo_pct + 0.5 {
+            "vocal_flow"
+        } else {
+            "atmo_sample"
+        }
+    }
+
+    fn build_vibe_corridors(&self, ranked: &[ScoredCandidate]) -> Vec<VibeCorridor> {
+        let seed_dsp = self.seeds.first().map(|s| &s.dsp);
+        let is_heavy_808 = seed_dsp
+            .map(|d| d.sub_bass_ratio >= 0.28 || d.bass_distortion >= 0.25)
+            .unwrap_or(false);
+        let is_glitch_synth = seed_dsp
+            .map(|d| d.glitch_brightness >= 0.65)
+            .unwrap_or(false);
+
+        let mut beat_artists = Vec::new();
+        let mut vocal_artists = Vec::new();
+        let mut atmo_artists = Vec::new();
+        let mut beat_count = 0usize;
+        let mut vocal_count = 0usize;
+        let mut atmo_count = 0usize;
+
+        for c in ranked {
+            match c.corridor_tag.as_str() {
+                "rhythm_bass" => {
+                    beat_count += 1;
+                    if beat_artists.len() < 3 && !beat_artists.contains(&c.track.meta.artist) {
+                        beat_artists.push(c.track.meta.artist.clone());
+                    }
+                }
+                "vocal_flow" => {
+                    vocal_count += 1;
+                    if vocal_artists.len() < 3 && !vocal_artists.contains(&c.track.meta.artist) {
+                        vocal_artists.push(c.track.meta.artist.clone());
+                    }
+                }
+                _ => {
+                    atmo_count += 1;
+                    if atmo_artists.len() < 3 && !atmo_artists.contains(&c.track.meta.artist) {
+                        atmo_artists.push(c.track.meta.artist.clone());
+                    }
+                }
+            }
+        }
+
+        let all_artists: Vec<String> = ranked
+            .iter()
+            .take(3)
+            .map(|c| c.track.meta.artist.clone())
+            .collect();
+
+        vec![
+            VibeCorridor {
+                id: "all".to_string(),
+                title: "ALLE PASSENDEN".to_string(),
+                description: "Gesamter Szene- & Klang-Pool".to_string(),
+                sample_artists: if all_artists.is_empty() {
+                    "—".to_string()
+                } else {
+                    all_artists.join(", ")
+                },
+                track_count: ranked.len(),
+                active: self.active_corridor == "all",
+            },
+            VibeCorridor {
+                id: "rhythm_bass".to_string(),
+                title: if is_heavy_808 {
+                    "BEAT & 808-BOUNCE".to_string()
+                } else {
+                    "DRUM-GROOVE & POCKET".to_string()
+                },
+                description: "Dominanter Rhythmus-, Tempo- & Bass-Match".to_string(),
+                sample_artists: if beat_artists.is_empty() {
+                    "—".to_string()
+                } else {
+                    beat_artists.join(", ")
+                },
+                track_count: beat_count,
+                active: self.active_corridor == "rhythm_bass",
+            },
+            VibeCorridor {
+                id: "vocal_flow".to_string(),
+                title: "FLOW & VOCAL-TIMBRE".to_string(),
+                description: "Stimmfarbe, Artikulations-Cadence & Delivery".to_string(),
+                sample_artists: if vocal_artists.is_empty() {
+                    "—".to_string()
+                } else {
+                    vocal_artists.join(", ")
+                },
+                track_count: vocal_count,
+                active: self.active_corridor == "vocal_flow",
+            },
+            VibeCorridor {
+                id: "atmo_sample".to_string(),
+                title: if is_glitch_synth {
+                    "SYNTH & GLITCH-ATMO".to_string()
+                } else {
+                    "SAMPLE & HARMONIE-VIBE".to_string()
+                },
+                description: "Harmonische Akkord-Farbe, Sample-Waerme & Textur".to_string(),
+                sample_artists: if atmo_artists.is_empty() {
+                    "—".to_string()
+                } else {
+                    atmo_artists.join(", ")
+                },
+                track_count: atmo_count,
+                active: self.active_corridor == "atmo_sample",
+            },
+        ]
+    }
+
     fn score_single_candidate(
         &self,
         track: &AnalyzedTrack,
@@ -219,15 +410,23 @@ impl DiscoverySession {
         w_vocal: f32,
         w_atmo: f32,
     ) -> ScoredCandidate {
-        let raw_beat = cosine_similarity(&self.target_beat, &track.dsp.v_beat);
-        let raw_vocal = cosine_similarity(&self.target_vocal, &track.dsp.v_vocal);
-        let raw_atmo = cosine_similarity(&self.target_atmo, &track.dsp.v_atmo);
+        let raw_beat = self
+            .metric_model
+            .sim_beat(&self.target_beat, &track.dsp.v_beat);
+        let raw_vocal = self
+            .metric_model
+            .sim_vocal(&self.target_vocal, &track.dsp.v_vocal);
+        let raw_atmo = self
+            .metric_model
+            .sim_atmo(&self.target_atmo, &track.dsp.v_atmo);
 
         let beat_pct = cosine_to_percentage(raw_beat);
         let vocal_pct = cosine_to_percentage(raw_vocal);
         let atmo_pct = cosine_to_percentage(raw_atmo);
 
-        // 1. Hybrid Linear + Harmonic Mean with Bottleneck Penalty against single-channel failures
+        let corridor_tag = self.classify_corridor(beat_pct, vocal_pct, atmo_pct);
+
+        // 1. Hybrid Linear + Harmonic Mean with Bottleneck Penalty
         let s_lin = w_beat * beat_pct + w_vocal * vocal_pct + w_atmo * atmo_pct;
         let s_harm = 1.0
             / (w_beat / (beat_pct + 10.0)
@@ -240,7 +439,10 @@ impl DiscoverySession {
 
         let mut total = 0.72 * s_lin + 0.28 * s_harm - 0.35 * bottleneck;
 
-        // 2. Continuous Multi-Octave Gaussian Tempo Kernel coupled to Beat weight w_beat
+        // 2. Scene Consensus Affinity Bonus (rewards candidates verified across multiple scene sources)
+        total += (track.meta.scene_affinity - 0.72) * 15.0;
+
+        // 3. Continuous Multi-Octave Gaussian Tempo Kernel coupled to Beat weight w_beat
         let bpm_diff = (track.dsp.bpm - self.target_bpm)
             .abs()
             .min((track.dsp.bpm * 2.0 - self.target_bpm).abs())
@@ -249,13 +451,15 @@ impl DiscoverySession {
         let bpm_bonus = (1.6 + 4.2 * w_beat) * (2.0 * gauss_bpm - 1.0);
         total += bpm_bonus;
 
-        // 3. Bridge-Mode Symmetry Bonus (rewards true bridge tracks uniting multiple seeds over 1-seed clones)
+        // 5. Bridge-Mode Symmetry Bonus
         if self.seeds.len() >= 2 {
             let mut seed_sims = Vec::with_capacity(self.seeds.len());
             for s in &self.seeds {
-                let sb = cosine_similarity(&s.dsp.v_beat, &track.dsp.v_beat);
-                let sv = cosine_similarity(&s.dsp.v_vocal, &track.dsp.v_vocal);
-                let sa = cosine_similarity(&s.dsp.v_atmo, &track.dsp.v_atmo);
+                let sb = self.metric_model.sim_beat(&s.dsp.v_beat, &track.dsp.v_beat);
+                let sv = self
+                    .metric_model
+                    .sim_vocal(&s.dsp.v_vocal, &track.dsp.v_vocal);
+                let sa = self.metric_model.sim_atmo(&s.dsp.v_atmo, &track.dsp.v_atmo);
                 seed_sims.push(w_beat * sb + w_vocal * sv + w_atmo * sa);
             }
             let min_sim = seed_sims
@@ -273,25 +477,31 @@ impl DiscoverySession {
             total += bridge_mod;
         }
 
-        // 4. Underground slider modifier (-1.0 mainstream to +1.0 deep underground)
+        // 6. Underground slider modifier
         let obscurity = 1.0 - track.meta.popularity_score;
         let ug_mod = self.weights.underground * (obscurity - 0.45) * 16.0;
         total += ug_mod;
 
-        // 5. Cross-session repeat penalty
+        // 7. Cross-session repeat penalty
         if self.prev_session_dedups.contains(&track.meta.dedup_key) {
             total -= 18.0;
         }
 
-        // 6. Session exploration jitter (-1.2 .. +1.2)
+        // 8. Session exploration jitter (-1.1 .. +1.1)
         total += session_track_jitter(&self.session_id, &track.meta.dedup_key);
 
-        // 7. Mixer-weighted Negative Anchor Penalty ("Kill Vibe" filter)
+        // 9. Mixer-weighted Negative Anchor Penalty ("Kill Vibe" filter)
         let mut neg_penalty = 0.0f32;
         for neg in &self.negative_anchors {
-            let n_beat = cosine_similarity(&neg.dsp.v_beat, &track.dsp.v_beat);
-            let n_vocal = cosine_similarity(&neg.dsp.v_vocal, &track.dsp.v_vocal);
-            let n_atmo = cosine_similarity(&neg.dsp.v_atmo, &track.dsp.v_atmo);
+            let n_beat = self
+                .metric_model
+                .sim_beat(&neg.dsp.v_beat, &track.dsp.v_beat);
+            let n_vocal = self
+                .metric_model
+                .sim_vocal(&neg.dsp.v_vocal, &track.dsp.v_vocal);
+            let n_atmo = self
+                .metric_model
+                .sim_atmo(&neg.dsp.v_atmo, &track.dsp.v_atmo);
             let n_comb = w_beat * n_beat + w_vocal * n_vocal + w_atmo * n_atmo;
             if n_comb > 0.28 {
                 let p = (42.0 * (n_comb - 0.28).powf(1.3)).clamp(0.0, 36.0);
@@ -304,25 +514,30 @@ impl DiscoverySession {
 
         let total_score = (total.clamp(5.0, 99.4) * 10.0).round() / 10.0;
 
-        let mut explanation = Vec::with_capacity(5);
+        let corridor_label = match corridor_tag {
+            "rhythm_bass" => "Korridor: Beat & Groove",
+            "vocal_flow" => "Korridor: Flow & Vocals",
+            _ => "Korridor: Sample & Atmo",
+        };
+
+        let mut explanation = Vec::with_capacity(6);
+        explanation.push(corridor_label.to_string());
         explanation.push(format!(
             "{:.1} BPM (Drop @ {:.1}s)",
             track.dsp.bpm, track.dsp.drop_start_sec
         ));
         explanation.push(format!(
-            "Beat/808: {:.0}% | Vocals: {:.0}% | Atmo: {:.0}%",
+            "Beat: {:.0}% | Vocals: {:.0}% | Atmo: {:.0}%",
             beat_pct, vocal_pct, atmo_pct
         ));
-        if track.dsp.bass_distortion >= 0.42 {
-            explanation.push(format!(
-                "Hohe 808-Saettigung ({:.0}%)",
-                track.dsp.bass_distortion * 100.0
-            ));
-        }
+        explanation.push(format!(
+            "Szene-Konsens: {:.0}% ({})",
+            track.meta.scene_affinity * 100.0,
+            track.meta.discovery_channel
+        ));
         if obscurity >= 0.65 {
-            explanation.push("Underground-Release".to_string());
+            explanation.push("Underground-Cut".to_string());
         }
-        explanation.push(format!("Quelle: {}", track.meta.discovery_channel));
 
         let (map_x, map_y) = self.project_to_2d(
             track, raw_beat, raw_vocal, raw_atmo, w_beat, w_vocal, w_atmo,
@@ -335,13 +550,13 @@ impl DiscoverySession {
             vocal_similarity: vocal_pct,
             atmo_similarity: atmo_pct,
             negative_penalty: (neg_penalty * 10.0).round() / 10.0,
+            corridor_tag: corridor_tag.to_string(),
             explanation,
             map_x,
             map_y,
         }
     }
 
-    /// Singularity-free 48-D hyperplane projection onto the 2D Sonic Map radar.
     fn project_to_2d(
         &self,
         track: &AnalyzedTrack,
@@ -360,7 +575,6 @@ impl DiscoverySession {
         let mean_dist: f32 = self.seeds.iter().map(|s| s.dsp.bass_distortion).sum::<f32>() / n_s;
         let mean_vocal: f32 = self.seeds.iter().map(|s| s.dsp.vocal_presence).sum::<f32>() / n_s;
 
-        // X-axis: Tempo + High-Frequency Glitch Drive vs. Warm/Slow
         let ux = ((track.dsp.bpm - self.target_bpm) / 28.0) * 0.35
             + (track.dsp.glitch_brightness - mean_glitch) * 1.15
             + (track.dsp.v_beat.get(7).copied().unwrap_or(0.0)
@@ -369,14 +583,12 @@ impl DiscoverySession {
                 - self.target_beat.get(8).copied().unwrap_or(0.0))
                 * 0.35;
 
-        // Y-axis: Sub-Bass + Darkness + 808 Saturation vs. Vocal & Mid Presence
         let uy = (track.dsp.darkness_index - mean_dark) * 1.10
             + (track.dsp.sub_bass_ratio - mean_sub) * 1.35
             + (track.dsp.bass_distortion - mean_dist) * 0.45
             - (track.dsp.vocal_presence - mean_vocal) * 1.15
             + (raw_atmo - raw_vocal) * 0.30;
 
-        // Orthogonal 48-D residual components to eliminate atan2 direction singularity when ux ~ uy ~ 0
         let mut rho_x = 0.0f32;
         let mut rho_y = 0.0f32;
         for i in 0..8 {
@@ -399,8 +611,11 @@ impl DiscoverySession {
         let ty = uy + 0.22 * rho_y;
         let r_tilde = (tx * tx + ty * ty + 1e-4).sqrt();
 
-        let weighted_sim = (w_beat * raw_beat + w_vocal * raw_vocal + w_atmo * raw_atmo).clamp(-0.85, 0.96);
-        let r_sim = ((1.0 - weighted_sim).max(0.02) * 0.65).sqrt().clamp(0.10, 0.92);
+        let weighted_sim =
+            (w_beat * raw_beat + w_vocal * raw_vocal + w_atmo * raw_atmo).clamp(-0.85, 0.96);
+        let r_sim = ((1.0 - weighted_sim).max(0.02) * 0.65)
+            .sqrt()
+            .clamp(0.10, 0.92);
         let r_final = (0.55 * r_sim + 0.45 * (1.35 * r_tilde).tanh()).clamp(0.08, 0.92);
 
         let x = (r_final * (tx / r_tilde)).clamp(-0.92, 0.92);
@@ -410,6 +625,7 @@ impl DiscoverySession {
 
     pub fn snapshot(&self) -> SessionSnapshot {
         let ranked = self.ranked_candidates();
+        let vibe_corridors = self.build_vibe_corridors(&ranked);
         let current_card = ranked.first().cloned();
         let queue_preview: Vec<ScoredCandidate> = ranked.iter().skip(1).take(12).cloned().collect();
 
@@ -438,6 +654,7 @@ impl DiscoverySession {
                 beat_similarity: 100.0,
                 vocal_similarity: 100.0,
                 atmo_similarity: 100.0,
+                corridor_tag: "seed".to_string(),
                 x: sx,
                 y: sy,
                 kind: "seed".to_string(),
@@ -461,6 +678,7 @@ impl DiscoverySession {
                 beat_similarity: sc.beat_similarity,
                 vocal_similarity: sc.vocal_similarity,
                 atmo_similarity: sc.atmo_similarity,
+                corridor_tag: sc.corridor_tag,
                 x: sc.map_x,
                 y: sc.map_y,
                 kind: "liked".to_string(),
@@ -480,6 +698,7 @@ impl DiscoverySession {
                 beat_similarity: c.beat_similarity,
                 vocal_similarity: c.vocal_similarity,
                 atmo_similarity: c.atmo_similarity,
+                corridor_tag: c.corridor_tag.clone(),
                 x: c.map_x,
                 y: c.map_y,
                 kind: "candidate".to_string(),
@@ -500,6 +719,7 @@ impl DiscoverySession {
                 beat_similarity: sc.beat_similarity,
                 vocal_similarity: sc.vocal_similarity,
                 atmo_similarity: sc.atmo_similarity,
+                corridor_tag: sc.corridor_tag,
                 x: sc.map_x,
                 y: sc.map_y,
                 kind: "negative".to_string(),
@@ -514,6 +734,8 @@ impl DiscoverySession {
             seen_count: self.seen_ids.len().saturating_sub(self.seeds.len()),
             pool_size: ranked.len(),
             weights: self.weights,
+            active_corridor: self.active_corridor.clone(),
+            vibe_corridors,
             current_card,
             queue_preview,
             map_points,
@@ -521,9 +743,6 @@ impl DiscoverySession {
     }
 }
 
-/// Gram-Schmidt orthogonal subspace elimination for Negative Anchors ("Kill Vibe"):
-/// Computes the component `d` of `neg` that is orthogonal to the positive seed anchor `seed_anchor`,
-/// and pushes `target` out of `d`'s half-space without eroding shared positive features.
 fn gram_schmidt_repel(target: &[f32], seed_anchor: &[f32], neg: &[f32]) -> Vec<f32> {
     let dim = target.len();
     if dim == 0 || seed_anchor.len() != dim || neg.len() != dim {
@@ -584,7 +803,7 @@ fn session_track_jitter(session_id: &str, dedup_key: &str) -> f32 {
         h = h.wrapping_mul(0x01000193);
     }
     let norm = (h % 1000) as f32 / 1000.0;
-    (norm - 0.5) * 2.4
+    (norm - 0.5) * 2.2
 }
 
 fn compute_seed_centroid(seeds: &[AnalyzedTrack]) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32) {

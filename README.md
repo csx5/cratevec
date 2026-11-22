@@ -41,9 +41,13 @@ Das Projekt funktioniert **out-of-the-box ohne API-Keys** (Zero-Config) und laeu
 
 ## Schnellstart
 
-### 1. CLI-Analyse im Terminal testen
+### 1. CLI-Analyse & Contrastive Metric Training im Terminal
 ```bash
+# Seed-Analyse
 cargo run --release -p cratevec-cli -- "PIXY - LEGACY"
+
+# 48-D Mahalanobis Metric Learning (Offline Triplet-Margin-Training)
+cargo run --release -p cratevec-cli -- train
 ```
 
 ### 2. Hybrid-Server & Web/Desktop-UI starten

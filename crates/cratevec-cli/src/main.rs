@@ -8,6 +8,51 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("train") {
+        let engine = CrateVecEngine::new(None);
+        let seed_clusters: Vec<&str> = vec![
+            "PIXY - LEGACY",
+            "Playboi Carti - Rockstar Made",
+            "Gesaffelstein - Pursuit",
+            "Deftones - Change (In the House of Flies)",
+            "Kendrick Lamar - XXX.",
+        ];
+
+        println!("==================================================================");
+        println!(" CRATEVEC METRIC TRAINER // 48-D Contrastive Triplet Learning");
+        println!("==================================================================");
+        let report = engine.train_metric_model(&seed_clusters, 140).await?;
+
+        println!(
+            " Trainings-Korpus   : {} Tracks | {} Akustische Cluster | {} Triplets",
+            report.num_tracks, report.num_clusters, report.num_triplets
+        );
+        println!(
+            " Triplet Margin Loss: {:.4} -> {:.4} ({} Epochen)",
+            report.initial_loss, report.final_loss, report.epochs
+        );
+        println!(
+            " Separation Accuracy: {:.2}% (Ungewichtet) -> {:.2}% (Trainiertes Mahalanobis-Modell)",
+            report.baseline_accuracy, report.trained_accuracy
+        );
+        println!("------------------------------------------------------------------");
+        println!(" Top gelernte Beat/808-Gewichte:");
+        for (name, w) in &report.top_beat_features {
+            println!("   * {:<34} : {:.3}x", name, w);
+        }
+        println!(" Top gelernte Vocal/MFCC-Gewichte:");
+        for (name, w) in &report.top_vocal_features {
+            println!("   * {:<34} : {:.3}x", name, w);
+        }
+        println!(" Top gelernte Atmo/Harmonik-Gewichte:");
+        for (name, w) in &report.top_atmo_features {
+            println!("   * {:<34} : {:.3}x", name, w);
+        }
+        println!("==================================================================");
+        return Ok(());
+    }
+
     let query = if args.is_empty() {
         "PIXY - LEGACY".to_string()
     } else {
@@ -41,8 +86,19 @@ async fn main() -> Result<()> {
     }
 
     println!("------------------------------------------------------------------");
+    println!(" Erkannte Vibe-Korridore:");
+    for (idx, vc) in snapshot.vibe_corridors.iter().enumerate() {
+        println!(
+            "   [0{}] {:<26} ({:02} Tracks) | {}",
+            idx + 1,
+            vc.title,
+            vc.track_count,
+            vc.sample_artists
+        );
+    }
+    println!("------------------------------------------------------------------");
     println!(
-        " Analysierter Kandidaten-Pool: {} Tracks (Top Matches nach DSP-Vektor)",
+        " Analysierter Kandidaten-Pool: {} Tracks (Top Matches nach DSP & Szene-Konsens)",
         snapshot.pool_size
     );
     println!("------------------------------------------------------------------");

@@ -18,6 +18,14 @@ pub struct TrackMetadata {
     /// Normalized 0.0 (deep underground) to 1.0 (global mainstream chart hit)
     pub popularity_score: f32,
     pub discovery_channel: String,
+    /// Multi-source scene graph consensus score (0.0 .. 1.0): measures how strongly
+    /// this candidate is anchored in the seed track's real musical neighborhood.
+    #[serde(default = "default_scene_affinity")]
+    pub scene_affinity: f32,
+}
+
+fn default_scene_affinity() -> f32 {
+    0.75
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +42,7 @@ pub struct AcousticFingerprint {
     pub waveform_peaks: Vec<f32>,
     /// 16-dim L2-normalized vector: Rhythm, BPM, sub-bass pressure, 808 harmonic distortion, transient punch
     pub v_beat: Vec<f32>,
-    /// 16-dim L2-normalized vector: Vocal-band Mel filterbank cepstrum (300-4500 Hz), formant profile, compression
+    /// 16-dim L2-normalized vector: Vocal-band Mel filterbank cepstrum (300-4500 Hz), Delta-MFCCs, formants
     pub v_vocal: Vec<f32>,
     /// 16-dim L2-normalized vector: Harmonic chroma, spectral contrast, synth flatness, high-freq glitch texture
     pub v_atmo: Vec<f32>,
@@ -78,6 +86,16 @@ impl MixerWeights {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VibeCorridor {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub sample_artists: String,
+    pub track_count: usize,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredCandidate {
     pub track: AnalyzedTrack,
     pub total_score: f32,
@@ -85,6 +103,7 @@ pub struct ScoredCandidate {
     pub vocal_similarity: f32,
     pub atmo_similarity: f32,
     pub negative_penalty: f32,
+    pub corridor_tag: String,
     pub explanation: Vec<String>,
     /// 2D Sonic Map coordinate X (-1.0 .. +1.0)
     pub map_x: f32,
@@ -110,6 +129,8 @@ pub struct SessionSnapshot {
     pub seen_count: usize,
     pub pool_size: usize,
     pub weights: MixerWeights,
+    pub active_corridor: String,
+    pub vibe_corridors: Vec<VibeCorridor>,
     pub current_card: Option<ScoredCandidate>,
     pub queue_preview: Vec<ScoredCandidate>,
     pub map_points: Vec<SonicMapPoint>,
@@ -128,6 +149,7 @@ pub struct SonicMapPoint {
     pub beat_similarity: f32,
     pub vocal_similarity: f32,
     pub atmo_similarity: f32,
+    pub corridor_tag: String,
     pub x: f32,
     pub y: f32,
     pub kind: String, // "seed" | "candidate" | "liked" | "negative"
