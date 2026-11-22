@@ -34,10 +34,11 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         hint.mime_type("audio/mpeg");
     }
 
-    // For MP3 streams (such as Deezer CDN 30s previews), strip any ID3v2 header block
-    // (which in preview clips often contains truncated/oversized frame headers that cause
-    // symphonia-metadata's ID3v2 parser to fail with "out of bounds") and align to the first MPEG sync frame.
-    let slice = if bytes.len() > 8 && &bytes[4..8] != b"ftyp" && !bytes.starts_with(b"OggS") && !bytes.starts_with(b"RIFF") {
+    let slice = if bytes.len() > 8
+        && &bytes[4..8] != b"ftyp"
+        && !bytes.starts_with(b"OggS")
+        && !bytes.starts_with(b"RIFF")
+    {
         strip_id3_and_sync_mp3(bytes)
     } else {
         bytes
@@ -56,7 +57,14 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             },
             &MetadataOptions::default(),
         )
-        .map_err(|e| anyhow!("Audio format probe failed (total_len={}, stripped_len={}): {}", bytes.len(), slice.len(), e))?;
+        .map_err(|e| {
+            anyhow!(
+                "Audio format probe failed (total_len={}, stripped_len={}): {}",
+                bytes.len(),
+                slice.len(),
+                e
+            )
+        })?;
 
     let mut format = probed.format;
     let track = format
@@ -150,7 +158,6 @@ fn append_mono_samples(buf: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
     }
 }
 
-/// Full DSP extraction: Drop-Sniper beat drop detection, 64-bar waveform, and 3 centered L2 vectors.
 pub fn analyze_audio_bytes(bytes: &[u8]) -> Result<AcousticFingerprint> {
     let (samples, sample_rate) = decode_audio_bytes(bytes)?;
     Ok(analyze_pcm(&samples, sample_rate))
@@ -171,7 +178,6 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     }
     let global_rms = ((global_energy_sq / samples.len().max(1) as f64).sqrt()) as f32;
     let rms_db = 20.0 * (global_rms.max(1e-5)).log10();
-
     let norm_gain = 1.0 / max_abs.max(0.05);
 
     // 2. 64-bin waveform peaks for UI rendering
@@ -201,11 +207,12 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         *bar = ((*bar / max_bar).clamp(0.06, 1.0) * 100.0).round() / 100.0;
     }
 
-    // 3. STFT computation (N = 2048, hop = 1024)
+    // 3. Pass 1: STFT & Per-Frame Feature Extraction (N = 2048, hop = 1024)
     let n_fft = 2048usize;
     let hop = 1024usize;
     let n_bins = n_fft / 2;
     let df = sr / n_fft as f32;
+    let frames_per_sec = sr / hop as f32;
 
     let hann: Vec<f32> = (0..n_fft)
         .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (n_fft - 1) as f32).cos()))
@@ -214,6 +221,20 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n_fft);
     let mut fft_buf = vec![Complex { re: 0.0, im: 0.0 }; n_fft];
+
+    // 18 Mel-spaced control frequencies for 16 overlapping triangular vocal filters (240 Hz .. 5400 Hz)
+    let vocal_centers: [f32; 18] = [
+        240.0, 310.0, 395.0, 495.0, 610.0, 745.0, 900.0, 1080.0, 1290.0, 1535.0, 1820.0, 2150.0,
+        2535.0, 2985.0, 3500.0, 4100.0, 4720.0, 5400.0,
+    ];
+    let octave_bounds: [(f32, f32); 6] = [
+        (40.0, 120.0),
+        (120.0, 320.0),
+        (320.0, 850.0),
+        (850.0, 2200.0),
+        (2200.0, 5800.0),
+        (5800.0, 14500.0),
+    ];
 
     let num_frames = samples.len().saturating_sub(n_fft) / hop + 1;
     let mut frame_rms = Vec::with_capacity(num_frames);
@@ -230,30 +251,13 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     let mut spectral_centroids = Vec::with_capacity(num_frames);
     let mut spectral_flatness_vec = Vec::with_capacity(num_frames);
 
-    // 16 Mel-spaced vocal/mid filter centers (260 Hz .. 5200 Hz)
-    let vocal_band_edges: [f32; 17] = [
-        260.0, 340.0, 430.0, 540.0, 660.0, 800.0, 960.0, 1150.0, 1370.0, 1620.0, 1920.0, 2260.0,
-        2660.0, 3130.0, 3680.0, 4350.0, 5200.0,
-    ];
-    let mut vocal_mel_sum = [0.0f64; 16];
-    let mut vocal_mel_sq = [0.0f64; 16];
-
-    // 12 pitch-class chroma accumulator
-    let mut chroma_acc = [0.0f64; 12];
-    // 6-octave spectral contrast accumulator
-    let mut octave_contrast_acc = [0.0f64; 6];
-    let octave_bounds: [(f32, f32); 6] = [
-        (40.0, 120.0),
-        (120.0, 320.0),
-        (320.0, 850.0),
-        (850.0, 2200.0),
-        (2200.0, 5800.0),
-        (5800.0, 14500.0),
-    ];
+    let mut frame_vocal_logs: Vec<[f32; 16]> = Vec::with_capacity(num_frames);
+    let mut frame_chromas: Vec<[f32; 12]> = Vec::with_capacity(num_frames);
+    let mut frame_contrasts: Vec<[f32; 6]> = Vec::with_capacity(num_frames);
 
     let mut prev_low_e = 0.0f32;
     let mut prev_high_e = 0.0f32;
-    let mut active_frames = 0usize;
+    let mut mags = vec![0.0f32; n_bins];
 
     for frame_idx in 0..num_frames {
         let offset = frame_idx * hop;
@@ -288,8 +292,8 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         let mut log_mag_sum = 0.0f32;
         let mut mag_count = 0usize;
 
-        let mut frame_vocal_mel = [0.0f32; 16];
-        let mut mags = vec![0.0f32; n_bins];
+        let mut v_mel = [0.0f32; 16];
+        let mut f_chroma = [0.0f32; 12];
 
         for bin in 1..n_bins {
             let freq = bin as f32 * df;
@@ -324,21 +328,29 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
                 e_gair += power;
             }
 
-            // Vocal mel bands
-            if freq >= vocal_band_edges[0] && freq <= vocal_band_edges[16] {
+            // Triangular overlapping Mel filterbank in vocal band
+            if freq >= vocal_centers[0] && freq <= vocal_centers[17] {
                 for b in 0..16 {
-                    if freq >= vocal_band_edges[b] && freq < vocal_band_edges[b + 1] {
-                        frame_vocal_mel[b] += power;
-                        break;
+                    let f_left = vocal_centers[b];
+                    let f_mid = vocal_centers[b + 1];
+                    let f_right = vocal_centers[b + 2];
+                    if freq >= f_left && freq <= f_right {
+                        let tri_w = if freq <= f_mid {
+                            (freq - f_left) / (f_mid - f_left).max(1.0)
+                        } else {
+                            (f_right - freq) / (f_right - f_mid).max(1.0)
+                        };
+                        v_mel[b] += power * tri_w.max(0.0);
                     }
                 }
             }
 
-            // Chroma accumulation (110 Hz .. 3520 Hz)
-            if freq >= 110.0 && freq <= 3520.0 && f_rms > 0.03 {
+            // Octave-normalized (1/f weighted) chroma accumulation (100 Hz .. 3520 Hz)
+            if freq >= 100.0 && freq <= 3520.0 {
                 let midi = 69.0 + 12.0 * (freq / 440.0).log2();
                 let pitch_class = (midi.round() as i32).rem_euclid(12) as usize;
-                chroma_acc[pitch_class] += mag as f64;
+                let oct_norm_weight = 220.0 / freq;
+                f_chroma[pitch_class] += mag * oct_norm_weight;
             }
         }
 
@@ -373,37 +385,42 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         let flatness = (geom_mean / arith_mean).clamp(0.0, 1.0);
         spectral_flatness_vec.push(flatness);
 
-        if f_rms > 0.035 {
-            active_frames += 1;
-            let frame_v_tot = frame_vocal_mel.iter().sum::<f32>().max(1e-6);
-            for b in 0..16 {
-                let log_v = ((frame_vocal_mel[b] / frame_v_tot) + 1e-5).ln() as f64;
-                vocal_mel_sum[b] += log_v;
-                vocal_mel_sq[b] += log_v * log_v;
-            }
+        // Normalize frame vocal log-Mel and mean-center across the 16 bands
+        let v_tot = v_mel.iter().sum::<f32>().max(1e-6);
+        let mut v_logs = [0.0f32; 16];
+        let mut l_mean = 0.0f32;
+        for b in 0..16 {
+            let lv = ((v_mel[b] / v_tot) + 1e-5).ln();
+            v_logs[b] = lv;
+            l_mean += lv;
+        }
+        l_mean /= 16.0;
+        for b in 0..16 {
+            v_logs[b] -= l_mean;
+        }
+        frame_vocal_logs.push(v_logs);
+        frame_chromas.push(f_chroma);
 
-            // Octave spectral contrast
-            for (o_idx, &(f_lo, f_hi)) in octave_bounds.iter().enumerate() {
-                let b_lo = ((f_lo / df).floor() as usize).max(1);
-                let b_hi = ((f_hi / df).ceil() as usize).min(n_bins - 1);
-                if b_hi > b_lo + 2 {
-                    let mut slice: Vec<f32> = mags[b_lo..=b_hi].to_vec();
-                    slice.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let q_idx = (slice.len() / 5).max(1);
-                    let valley = slice[..q_idx].iter().sum::<f32>() / q_idx as f32;
-                    let peak = slice[slice.len() - q_idx..].iter().sum::<f32>() / q_idx as f32;
-                    let contrast = ((peak + 1e-5) / (valley + 1e-5)).ln();
-                    octave_contrast_acc[o_idx] += contrast as f64;
-                }
+        // 6-octave spectral contrast per frame
+        let mut f_oct = [0.0f32; 6];
+        for (o_idx, &(f_lo, f_hi)) in octave_bounds.iter().enumerate() {
+            let b_lo = ((f_lo / df).floor() as usize).max(1);
+            let b_hi = ((f_hi / df).ceil() as usize).min(n_bins - 1);
+            if b_hi > b_lo + 2 {
+                let mut slice: Vec<f32> = mags[b_lo..=b_hi].to_vec();
+                slice.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let q_idx = (slice.len() / 5).max(1);
+                let valley = slice[..q_idx].iter().sum::<f32>() / q_idx as f32;
+                let peak = slice[slice.len() - q_idx..].iter().sum::<f32>() / q_idx as f32;
+                f_oct[o_idx] = ((peak + 1e-5) / (valley + 1e-5)).ln();
             }
         }
+        frame_contrasts.push(f_oct);
     }
 
     let n_f = frame_rms.len().max(1);
-    let act_f = active_frames.max(1) as f64;
-    let frames_per_sec = sr / hop as f32;
 
-    // 4. DROP-SNIPER: Locate exact beat drop / chorus entry timestamp
+    // 4. DROP-SNIPER FIRST: Locate exact beat drop / chorus entry timestamp (or 0.0s if already in chorus)
     let drop_start_sec = detect_drop_timestamp(
         &frame_rms,
         &sub_bass_env,
@@ -411,20 +428,124 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         &onset_low_flux,
         frames_per_sec,
     );
+    let drop_frame = ((drop_start_sec * frames_per_sec).round() as usize).min(n_f.saturating_sub(20));
 
-    // 5. BPM & Rhythm autocorrelation
+    // 5. Drop-Gated Temporal Pooling: weight post-drop frames w_t = 1.0, pre-drop intro frames w_t = 0.20
+    let mut w_sum = 0.0f32;
+    let mut mean_sub = 0.0f32;
+    let mut mean_kick = 0.0f32;
+    let mut mean_lowmid = 0.0f32;
+    let mut mean_vcore = 0.0f32;
+    let mut mean_vbite = 0.0f32;
+    let mut mean_shigh = 0.0f32;
+    let mut mean_gair = 0.0f32;
+    let mut mean_low_flux = 0.0f32;
+    let mut mean_high_flux = 0.0f32;
+    let mut mean_centroid = 0.0f32;
+    let mut mean_flatness = 0.0f32;
+
+    let mut vocal_mel_sum = [0.0f64; 16];
+    let mut vocal_mel_sq = [0.0f64; 16];
+    let mut chroma_acc = [0.0f64; 12];
+    let mut oct_contrasts = [0.0f32; 6];
+    let mut active_weight_sum = 0.0f64;
+
+    // Also compute frame-wise first 4 MFCCs for Delta-MFCC articulation energy
+    let mut prev2_mfcc4 = [0.0f32; 4];
+    let mut prev1_mfcc4 = [0.0f32; 4];
+    let mut delta_mfcc_sq = [0.0f64; 4];
+    let mut delta_weight_sum = 0.0f64;
+
+    for t in 0..n_f {
+        let wt = if t >= drop_frame { 1.0f32 } else { 0.20f32 };
+        w_sum += wt;
+        mean_sub += wt * sub_bass_env[t];
+        mean_kick += wt * kick_punch_env[t];
+        mean_lowmid += wt * low_mid_env[t];
+        mean_vcore += wt * vocal_core_env[t];
+        mean_vbite += wt * vocal_bite_env[t];
+        mean_shigh += wt * synth_high_env[t];
+        mean_gair += wt * glitch_air_env[t];
+        mean_low_flux += wt * onset_low_flux[t];
+        mean_high_flux += wt * onset_high_flux[t];
+        mean_centroid += wt * spectral_centroids[t];
+        mean_flatness += wt * spectral_flatness_vec[t];
+
+        if frame_rms[t] > 0.032 {
+            let wd = wt as f64;
+            active_weight_sum += wd;
+            let v_logs = &frame_vocal_logs[t];
+            for b in 0..16 {
+                let lv = v_logs[b] as f64;
+                vocal_mel_sum[b] += wd * lv;
+                vocal_mel_sq[b] += wd * lv * lv;
+            }
+
+            // Compute first 4 DCT-II coefficients for this frame to measure temporal Delta-MFCCs
+            let mut cur_mfcc4 = [0.0f32; 4];
+            for k in 0..4 {
+                let mut s = 0.0f32;
+                for n in 0..16 {
+                    s += v_logs[n] * (PI * (k + 1) as f32 * (2 * n + 1) as f32 / 32.0).cos();
+                }
+                cur_mfcc4[k] = s * 0.25;
+            }
+            if t >= 2 {
+                delta_weight_sum += wd;
+                for k in 0..4 {
+                    let d = (cur_mfcc4[k] - prev2_mfcc4[k]) as f64;
+                    delta_mfcc_sq[k] += wd * d * d;
+                }
+            }
+            prev2_mfcc4 = prev1_mfcc4;
+            prev1_mfcc4 = cur_mfcc4;
+
+            // Tonality-weighted chroma accumulation (suppresses broadband drum transients)
+            let tonality_w = (1.0 - spectral_flatness_vec[t]).clamp(0.05, 1.0);
+            let chroma_w = wd * (tonality_w * tonality_w) as f64;
+            for pc in 0..12 {
+                chroma_acc[pc] += chroma_w * (frame_chromas[t][pc] as f64);
+            }
+
+            for o in 0..6 {
+                oct_contrasts[o] += wt * frame_contrasts[t][o];
+            }
+        }
+    }
+
+    let w_norm = w_sum.max(1e-5);
+    mean_sub /= w_norm;
+    mean_kick /= w_norm;
+    mean_lowmid /= w_norm;
+    mean_vcore /= w_norm;
+    mean_vbite /= w_norm;
+    mean_shigh /= w_norm;
+    mean_gair /= w_norm;
+    mean_low_flux /= w_norm;
+    mean_high_flux /= w_norm;
+    mean_centroid /= w_norm;
+    mean_flatness /= w_norm;
+
+    let act_w = active_weight_sum.max(1e-5);
+    for o in 0..6 {
+        oct_contrasts[o] /= act_w as f32;
+    }
+
+    // 6. Parabolic Sub-Frame BPM & Groove Autocorrelation (evaluated primarily on post-drop frames)
+    let post_low = if drop_frame + 120 < n_f {
+        &onset_low_flux[drop_frame..]
+    } else {
+        &onset_low_flux[..]
+    };
+    let post_high = if drop_frame + 120 < n_f {
+        &onset_high_flux[drop_frame..]
+    } else {
+        &onset_high_flux[..]
+    };
     let (bpm, tempo_strength, syncopation_ratio, double_time_ratio) =
-        estimate_bpm_and_groove(&onset_low_flux, &onset_high_flux, frames_per_sec);
+        estimate_bpm_and_groove(post_low, post_high, frames_per_sec);
 
-    // 6. Band energy ratios & 808 distortion analysis
-    let mean_sub = mean_f32(&sub_bass_env);
-    let mean_kick = mean_f32(&kick_punch_env);
-    let mean_lowmid = mean_f32(&low_mid_env);
-    let mean_vcore = mean_f32(&vocal_core_env);
-    let mean_vbite = mean_f32(&vocal_bite_env);
-    let mean_shigh = mean_f32(&synth_high_env);
-    let mean_gair = mean_f32(&glitch_air_env);
-
+    // 7. Band ratios & Sub-Bass Presence-Gated 808 Distortion
     let total_band_amp =
         (mean_sub + mean_kick + mean_lowmid + mean_vcore + mean_vbite + mean_shigh + mean_gair)
             .max(1e-5);
@@ -437,13 +558,14 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     let synth_high_ratio = mean_shigh / total_band_amp;
     let air_ratio = mean_gair / total_band_amp;
 
-    // 808 harmonic distortion: when sub-bass hits hard, how strong are upper bass harmonics (90-360 Hz)?
+    // 808 harmonic distortion gated by true sub-bass presence (20-90 Hz)
     let mut dist_acc = 0.0f32;
     let mut dist_count = 0usize;
     let sub_thresh = mean_sub * 1.15;
-    for i in 0..n_f {
+    for i in drop_frame..n_f {
         if sub_bass_env[i] > sub_thresh && sub_bass_env[i] > 1e-4 {
-            let harm_ratio = (kick_punch_env[i] + low_mid_env[i] * 0.85) / (sub_bass_env[i] + 1e-4);
+            let harm_ratio =
+                (kick_punch_env[i] + low_mid_env[i] * 0.85) / (sub_bass_env[i] + 1e-4);
             dist_acc += harm_ratio;
             dist_count += 1;
         }
@@ -453,21 +575,15 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
     } else {
         (mean_kick + mean_lowmid) / (mean_sub + 1e-4)
     };
-    let bass_distortion = (raw_distortion / 2.4).clamp(0.0, 1.0);
+    let sub_presence_gate = ((sub_bass_ratio - 0.10) / 0.14).clamp(0.0, 1.0);
+    let bass_distortion =
+        (sub_presence_gate * ((raw_distortion - 0.50) / 1.85).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
-    let low_flux_density = mean_f32(&onset_low_flux) / (mean_sub + mean_kick + 1e-4);
-    let high_flux_density = mean_f32(&onset_high_flux) / (mean_shigh + mean_gair + 1e-4);
-    let sub_crest = max_f32(&sub_bass_env) / (mean_sub + 1e-4);
+    let low_flux_density = mean_low_flux / (mean_sub + mean_kick + 1e-4);
+    let high_flux_density = mean_high_flux / (mean_shigh + mean_gair + 1e-4);
+    let sub_crest = max_f32(&sub_bass_env[drop_frame..]) / (mean_sub + 1e-4);
     let rms_variance = std_dev_f32(&frame_rms) / (mean_f32(&frame_rms) + 1e-4);
-
-    let mean_centroid = mean_f32(&spectral_centroids);
     let std_centroid = std_dev_f32(&spectral_centroids);
-    let mean_flatness = mean_f32(&spectral_flatness_vec);
-
-    let mut oct_contrasts = [0.0f32; 6];
-    for i in 0..6 {
-        oct_contrasts[i] = (octave_contrast_acc[i] / act_f) as f32;
-    }
 
     let glitch_brightness = ((synth_high_ratio * 3.2
         + air_ratio * 4.5
@@ -478,28 +594,46 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         .round()
         / 100.0;
 
-    // Chroma rotation to root pitch (key-invariant harmonic structure)
-    let mut root_pc = 0usize;
-    let mut max_c = -1.0f64;
+    // 8. Triad-Correlation Root Detection & Key-Invariant Chroma Structure + Chroma Entropy
     let chroma_sum = chroma_acc.iter().sum::<f64>().max(1e-6);
-    for (i, &c) in chroma_acc.iter().enumerate() {
-        if c > max_c {
-            max_c = c;
-            root_pc = i;
+    let mut norm_chroma = [0.0f32; 12];
+    for i in 0..12 {
+        norm_chroma[i] = (chroma_acc[i] / chroma_sum) as f32;
+    }
+
+    let mut root_pc = 0usize;
+    let mut best_triad_score = -1.0f32;
+    for r in 0..12 {
+        let tonic = norm_chroma[r];
+        let fifth = norm_chroma[(r + 7) % 12];
+        let third = norm_chroma[(r + 3) % 12].max(norm_chroma[(r + 4) % 12]);
+        let score = 1.0 * tonic + 0.55 * fifth + 0.45 * third;
+        if score > best_triad_score {
+            best_triad_score = score;
+            root_pc = r;
         }
     }
+
     let mut aligned_chroma = [0.0f32; 12];
+    let mut chroma_entropy = 0.0f32;
     for i in 0..12 {
-        aligned_chroma[i] = (chroma_acc[(root_pc + i) % 12] / chroma_sum) as f32;
+        let p = norm_chroma[(root_pc + i) % 12];
+        aligned_chroma[i] = p;
+        if p > 1e-5 {
+            chroma_entropy -= p * p.ln();
+        }
     }
-    // Minor / phrygian / dark harmonic intervals (b2 = 1, b3 = 3, tritone = 6, b6 = 8, b7 = 10)
+    chroma_entropy = (chroma_entropy / (12.0f32).ln()).clamp(0.0, 1.0);
+
     let dark_harmony = aligned_chroma[1] * 1.3
         + aligned_chroma[3] * 1.4
         + aligned_chroma[6] * 1.2
         + aligned_chroma[8] * 1.2
         + aligned_chroma[10] * 0.9;
-    let bright_harmony = aligned_chroma[4] * 1.4 + aligned_chroma[7] * 0.8 + aligned_chroma[9] * 1.1;
-    let harmonic_darkness = (dark_harmony / (dark_harmony + bright_harmony + 1e-5)).clamp(0.0, 1.0);
+    let bright_harmony =
+        aligned_chroma[4] * 1.4 + aligned_chroma[7] * 0.8 + aligned_chroma[9] * 1.1;
+    let harmonic_darkness =
+        (dark_harmony / (dark_harmony + bright_harmony + 1e-5)).clamp(0.0, 1.0);
 
     let darkness_index = (((sub_bass_ratio * 1.6 + harmonic_darkness * 0.7)
         - (mean_centroid / 8000.0) * 0.35)
@@ -508,88 +642,95 @@ pub fn analyze_pcm(samples: &[f32], sample_rate: u32) -> AcousticFingerprint {
         .round()
         / 100.0;
 
-    // 7. Construct the 3 centered, z-scored, L2-normalized 16-dimensional vectors
+    // 9. Construct the 3 centered, z-scored, L2-normalized 16-dimensional vectors
 
-    // --- Vector 1: v_beat (16 dims: BPM, groove, sub-bass pressure, 808 distortion, kick transients) ---
-    // Note: For BPM, we include both linear tempo and octave-folded tempo (since 70 BPM and 140 BPM share half-time trap feel)
-    let folded_bpm = if bpm < 105.0 { bpm * 2.0 } else { bpm };
+    // --- Vector 1: v_beat (16 dims: Continuous octave-invariant log2 BPM phase, sub-bass, 808 saturation, transients) ---
+    let oct_pos = (bpm / 95.0).log2().rem_euclid(1.0);
+    let bpm_oct = 95.0 * 2.0f32.powf(oct_pos); // Continuous in [95.0, 190.0)
+    let bpm_phase = 2.0 * PI * bpm.log2(); // 70 BPM and 140 BPM have identical phase angle!
+
     let beat_raw: [(f32, f32, f32); 16] = [
-        (folded_bpm, 138.0, 18.0),
-        ((folded_bpm * 2.0 * PI / 60.0).sin(), 0.0, 0.7),
-        ((folded_bpm * 2.0 * PI / 60.0).cos(), 0.0, 0.7),
-        (sub_bass_ratio, 0.22, 0.09),
-        (punch_ratio, 0.14, 0.06),
-        (lowmid_ratio, 0.14, 0.05),
-        (bass_distortion, 0.48, 0.20),
+        (bpm_oct, 134.0, 22.0),
+        (bpm_phase.sin(), 0.0, 0.707),
+        (bpm_phase.cos(), 0.0, 0.707),
+        (sub_bass_ratio, 0.22, 0.085),
+        (punch_ratio, 0.14, 0.055),
+        (lowmid_ratio, 0.14, 0.050),
+        (bass_distortion, 0.32, 0.20),
         (low_flux_density, 0.28, 0.11),
         (high_flux_density, 0.32, 0.12),
-        (tempo_strength, 0.45, 0.18),
+        (tempo_strength, 0.45, 0.17),
         (syncopation_ratio, 0.48, 0.16),
         (double_time_ratio, 0.52, 0.18),
-        (sub_crest, 2.4, 0.7),
-        (rms_variance, 0.32, 0.14),
-        (oct_contrasts[0], 1.8, 0.6),
-        (oct_contrasts[1], 1.9, 0.6),
+        (sub_crest, 2.3, 0.65),
+        (rms_variance, 0.31, 0.13),
+        (oct_contrasts[0], 1.85, 0.55),
+        (oct_contrasts[1], 1.95, 0.55),
     ];
     let v_beat = zscore_and_l2_normalize(&beat_raw);
 
-    // --- Vector 2: v_vocal (16 dims: DCT-II MFCCs of the 300-5200 Hz vocal Mel bands + formant/compression metrics) ---
+    // --- Vector 2: v_vocal (16 dims: 8 mean-centered DCT-II MFCCs + 4 Delta-MFCC dynamic energies + 4 vocal presence/formant metrics) ---
     let mut vocal_log_means = [0.0f32; 16];
     let mut vocal_log_vars = [0.0f32; 16];
     for b in 0..16 {
-        let m = (vocal_mel_sum[b] / act_f) as f32;
-        let v = ((vocal_mel_sq[b] / act_f) as f32 - m * m).max(0.0).sqrt();
+        let m = (vocal_mel_sum[b] / act_w) as f32;
+        let v = ((vocal_mel_sq[b] / act_w) as f32 - m * m).max(0.0).sqrt();
         vocal_log_means[b] = m;
         vocal_log_vars[b] = v;
     }
-    // Compute 12 DCT-II cepstral coefficients across the 16 vocal Mel bands
-    let mut vocal_cepstrum = [0.0f32; 12];
-    for k in 0..12 {
+    let mut vocal_cepstrum = [0.0f32; 8];
+    for k in 0..8 {
         let mut s = 0.0f32;
         for n in 0..16 {
             s += vocal_log_means[n] * (PI * (k + 1) as f32 * (2 * n + 1) as f32 / 32.0).cos();
         }
         vocal_cepstrum[k] = s * 0.25;
     }
+    let dw = delta_weight_sum.max(1e-5);
+    let d_mfcc0 = (delta_mfcc_sq[0] / dw).sqrt() as f32;
+    let d_mfcc1 = (delta_mfcc_sq[1] / dw).sqrt() as f32;
+    let d_mfcc2 = (delta_mfcc_sq[2] / dw).sqrt() as f32;
+    let d_mfcc3 = (delta_mfcc_sq[3] / dw).sqrt() as f32;
+
     let vocal_modulation = vocal_log_vars.iter().sum::<f32>() / 16.0;
     let vocal_raw: [(f32, f32, f32); 16] = [
-        (vocal_cepstrum[0], -0.4, 0.45),
-        (vocal_cepstrum[1], -0.1, 0.35),
-        (vocal_cepstrum[2], 0.0, 0.30),
-        (vocal_cepstrum[3], 0.0, 0.25),
-        (vocal_cepstrum[4], 0.0, 0.22),
-        (vocal_cepstrum[5], 0.0, 0.20),
-        (vocal_cepstrum[6], 0.0, 0.18),
-        (vocal_cepstrum[7], 0.0, 0.16),
-        (vocal_cepstrum[8], 0.0, 0.15),
-        (vocal_cepstrum[9], 0.0, 0.14),
-        (vocal_cepstrum[10], 0.0, 0.13),
-        (vocal_cepstrum[11], 0.0, 0.12),
+        (vocal_cepstrum[0], -0.25, 0.40),
+        (vocal_cepstrum[1], -0.05, 0.32),
+        (vocal_cepstrum[2], 0.0, 0.26),
+        (vocal_cepstrum[3], 0.0, 0.22),
+        (vocal_cepstrum[4], 0.0, 0.19),
+        (vocal_cepstrum[5], 0.0, 0.17),
+        (vocal_cepstrum[6], 0.0, 0.15),
+        (vocal_cepstrum[7], 0.0, 0.14),
+        (d_mfcc0, 0.24, 0.09),
+        (d_mfcc1, 0.18, 0.07),
+        (d_mfcc2, 0.15, 0.06),
+        (d_mfcc3, 0.13, 0.05),
         (vocal_presence, 0.34, 0.10),
         (vocal_bite_ratio, 0.32, 0.11),
-        (vocal_modulation, 0.55, 0.18),
+        (vocal_modulation, 0.52, 0.17),
         (oct_contrasts[3], 2.1, 0.55),
     ];
     let v_vocal = zscore_and_l2_normalize(&vocal_raw);
 
-    // --- Vector 3: v_atmo (16 dims: Harmonic intervals, spectral contrast, synth flatness, high-freq glitch texture) ---
+    // --- Vector 3: v_atmo (16 dims: Triad-aligned harmonic intervals, chroma entropy, spectral contrast, glitch air) ---
     let atmo_raw: [(f32, f32, f32); 16] = [
         (harmonic_darkness, 0.52, 0.14),
-        (aligned_chroma[1] + aligned_chroma[2], 0.15, 0.06), // 2nd intervals (tension)
-        (aligned_chroma[3], 0.09, 0.04),                     // Minor 3rd
-        (aligned_chroma[4], 0.08, 0.04),                     // Major 3rd
-        (aligned_chroma[5] + aligned_chroma[7], 0.19, 0.06), // 4th + 5th power intervals
-        (aligned_chroma[6], 0.06, 0.03),                     // Tritone dissonance
-        (aligned_chroma[8] + aligned_chroma[10], 0.16, 0.05), // Minor 6th + Minor 7th
+        (aligned_chroma[1] + aligned_chroma[2], 0.15, 0.055),
+        (aligned_chroma[3], 0.09, 0.038),
+        (aligned_chroma[4], 0.08, 0.038),
+        (aligned_chroma[5] + aligned_chroma[7], 0.19, 0.055),
+        (aligned_chroma[6], 0.06, 0.028),
+        (aligned_chroma[8] + aligned_chroma[10], 0.16, 0.048),
         (mean_centroid / 1000.0, 2.3, 0.85),
         (std_centroid / 1000.0, 0.75, 0.32),
-        (mean_flatness, 0.18, 0.09),
+        (mean_flatness, 0.18, 0.085),
         (synth_high_ratio, 0.09, 0.045),
         (air_ratio, 0.04, 0.025),
-        (oct_contrasts[2], 2.0, 0.5),
-        (oct_contrasts[4], 2.2, 0.6),
-        (oct_contrasts[5], 2.3, 0.65),
-        (darkness_index, 0.52, 0.16),
+        (oct_contrasts[2], 2.0, 0.50),
+        (oct_contrasts[4], 2.2, 0.58),
+        (oct_contrasts[5], 2.3, 0.62),
+        (chroma_entropy, 0.88, 0.07),
     ];
     let v_atmo = zscore_and_l2_normalize(&atmo_raw);
 
@@ -623,11 +764,22 @@ fn detect_drop_timestamp(
         return 0.0;
     }
 
+    // Check if the preview already starts directly in the chorus/drop at t = 0.0s
+    let mut composite_e: Vec<f32> = (0..n)
+        .map(|i| frame_rms[i] * 1.1 + sub_bass[i] * 1.8 + kick_punch[i] * 1.5)
+        .collect();
+    let init_end = ((1.8 * frames_per_sec) as usize).min(n);
+    let init_energy = mean_f32(&composite_e[..init_end]);
+
+    composite_e.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p85_energy = composite_e[(n * 85 / 100).min(n - 1)].max(1e-4);
+
     let lookahead = (2.8 * frames_per_sec) as usize;
-    let lookbehind = (1.3 * frames_per_sec) as usize;
+    let lookbehind = (1.4 * frames_per_sec) as usize;
 
     let mut best_frame = min_frame;
     let mut best_score = f32::MIN;
+    let mut max_rel_jump = 1.0f32;
 
     for f in min_frame..max_frame {
         let fwd_end = (f + lookahead).min(n);
@@ -645,16 +797,26 @@ fn detect_drop_timestamp(
 
         let mut bwd_energy = 0.0f32;
         for i in bwd_start..f {
-            bwd_energy += frame_rms[i] * 1.1 + sub_bass[i] * 1.5 + kick_punch[i] * 1.2;
+            bwd_energy += frame_rms[i] * 1.1 + sub_bass[i] * 1.6 + kick_punch[i] * 1.3;
         }
         bwd_energy /= bwd_len;
 
-        let jump = (fwd_energy - bwd_energy * 0.72).max(0.0);
-        let score = fwd_energy * 0.65 + jump * 0.55;
+        let rel_jump = fwd_energy / (bwd_energy + 0.04);
+        if rel_jump > max_rel_jump {
+            max_rel_jump = rel_jump;
+        }
+
+        let jump = (fwd_energy - bwd_energy * 0.82).max(0.0) * rel_jump.clamp(0.8, 2.5);
+        let score = fwd_energy * 0.38 + jump * 0.62;
         if score > best_score {
             best_score = score;
             best_frame = f;
         }
+    }
+
+    // If the clip starts at >= 82% of P85 energy and has no pronounced build-up jump (> 1.42x), start at 0.0s
+    if init_energy >= 0.82 * p85_energy && max_rel_jump < 1.42 {
+        return 0.0;
     }
 
     let sec = (best_frame as f32 / frames_per_sec).clamp(0.0, 20.0);
@@ -673,50 +835,76 @@ fn estimate_bpm_and_groove(
 
     let mut combined = Vec::with_capacity(n);
     for i in 0..n {
-        combined.push(onset_low[i] * 1.4 + onset_high[i] * 0.6);
+        combined.push(onset_low[i] * 1.45 + onset_high[i] * 0.55);
     }
     let mean_c = mean_f32(&combined);
     for v in &mut combined {
         *v = (*v - mean_c).max(0.0);
     }
 
-    let min_bpm = 88.0f32;
-    let max_bpm = 180.0f32;
-    let min_lag = ((60.0 / max_bpm) * frames_per_sec).round() as usize;
-    let max_lag = ((60.0 / min_bpm) * frames_per_sec).round() as usize;
+    let min_bpm = 84.0f32;
+    let max_bpm = 184.0f32;
+    let min_lag = ((60.0 / max_bpm) * frames_per_sec).floor() as usize;
+    let max_lag = ((60.0 / min_bpm) * frames_per_sec).ceil() as usize;
 
     let mut zero_lag_e = 1e-5f32;
     for &v in &combined {
         zero_lag_e += v * v;
     }
 
-    let mut best_lag = ((60.0 / 138.0) * frames_per_sec).round() as usize;
-    let mut best_corr = -1.0f32;
-
-    for lag in min_lag.max(4)..=max_lag.min(n / 2) {
-        let mut corr = 0.0f32;
+    let max_eval_lag = (max_lag * 2 + 2).min(n / 2);
+    let mut raw_corr = vec![0.0f32; max_eval_lag + 1];
+    for lag in min_lag.max(3)..=max_eval_lag {
+        let mut c = 0.0f32;
         for i in 0..(n - lag) {
-            corr += combined[i] * combined[i + lag];
+            c += combined[i] * combined[i + lag];
         }
-        // Also reinforce 2x lag (two-beat phrase consistency)
-        if lag * 2 < n {
-            let mut corr2 = 0.0f32;
-            for i in 0..(n - lag * 2) {
-                corr2 += combined[i] * combined[i + lag * 2];
-            }
-            corr = corr * 0.7 + corr2 * 0.3;
-        }
-        let norm_corr = corr / zero_lag_e;
-        if norm_corr > best_corr {
-            best_corr = norm_corr;
+        raw_corr[lag] = c / zero_lag_e;
+    }
+
+    // Harmonic comb correlation with gentle log-Gaussian prior centered at 130 BPM
+    let lo = min_lag.max(4);
+    let hi = max_lag.min(max_eval_lag);
+    let mut comb_corr = vec![0.0f32; hi + 1];
+    let mut best_lag = ((60.0 / 135.0) * frames_per_sec).round() as usize;
+    let mut best_score = -1.0f32;
+
+    for lag in lo..=hi {
+        let r1 = raw_corr[lag];
+        let r2 = if lag * 2 <= max_eval_lag {
+            raw_corr[lag * 2]
+        } else {
+            r1
+        };
+        let cand_bpm = 60.0 * frames_per_sec / lag as f32;
+        let log_prior = (-0.5 * ((cand_bpm / 130.0).log2() / 0.65).powi(2)).exp();
+        let score = (0.68 * r1 + 0.32 * r2) * (0.85 + 0.15 * log_prior);
+        comb_corr[lag] = score;
+        if score > best_score {
+            best_score = score;
             best_lag = lag;
         }
     }
 
-    let bpm = (60.0 * frames_per_sec / best_lag.max(1) as f32).clamp(85.0, 185.0);
-    let tempo_strength = best_corr.clamp(0.05, 1.0);
+    // Parabolic sub-frame interpolation around best_lag to remove integer-lag BPM quantization
+    let interp_lag = if best_lag > lo && best_lag < hi {
+        let y0 = comb_corr[best_lag - 1];
+        let y1 = comb_corr[best_lag];
+        let y2 = comb_corr[best_lag + 1];
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() > 1e-6 {
+            let delta = (0.5 * (y0 - y2) / denom).clamp(-0.48, 0.48);
+            best_lag as f32 + delta
+        } else {
+            best_lag as f32
+        }
+    } else {
+        best_lag as f32
+    };
 
-    // Check off-beat / triplet syncopation energy at 0.5x and 0.75x lag
+    let bpm = (60.0 * frames_per_sec / interp_lag.max(1.0)).clamp(84.0, 184.0);
+    let tempo_strength = raw_corr.get(best_lag).copied().unwrap_or(0.5).clamp(0.05, 1.0);
+
     let half_lag = (best_lag / 2).max(2);
     let triplet_lag = ((best_lag * 3) / 4).max(2);
     let mut half_corr = 0.0f32;
@@ -762,12 +950,10 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     (dot / denom).clamp(-1.0, 1.0)
 }
 
-/// Convert raw centered cosine similarity (-1.0 .. +1.0) into an intuitive 0..100% match score.
+/// Contrast-sharpened percentage mapping centered around empirical baseline cos_0 = 0.08.
 pub fn cosine_to_percentage(cos: f32) -> f32 {
-    // With zero-mean z-scored 16-D vectors, random tracks average cos ~ 0.0 (50%),
-    // acoustically aligned tracks sit around cos 0.35 .. 0.95 (75% .. 99%).
-    let mapped = 50.0 + 50.0 * (cos * 1.35).tanh();
-    (mapped.clamp(1.0, 99.6) * 10.0).round() / 10.0
+    let mapped = 50.0 + 51.5 * ((cos - 0.08) * 1.62).tanh();
+    (mapped.clamp(2.0, 99.6) * 10.0).round() / 10.0
 }
 
 fn mean_f32(slice: &[f32]) -> f32 {
@@ -823,18 +1009,24 @@ fn find_mp3_sync_offset(bytes: &[u8]) -> Option<usize> {
             let sr_idx = ((bytes[i + 2] >> 2) & 0x03) as usize;
             let padding = ((bytes[i + 2] >> 1) & 0x01) as usize;
 
-            if version_id != 1 && layer == 1 && bitrate_idx != 0 && bitrate_idx != 15 && sr_idx != 3 {
-                // Verify MPEG-1 Layer III frame length points to the next sync word
+            if version_id != 1
+                && layer == 1
+                && bitrate_idx != 0
+                && bitrate_idx != 15
+                && sr_idx != 3
+            {
                 if version_id == 3 {
                     const BITRATES: [usize; 16] = [
                         0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
                     ];
                     const SAMPLE_RATES: [usize; 4] = [44100, 48000, 32000, 1];
-                    let frame_len = (144 * BITRATES[bitrate_idx] * 1000) / SAMPLE_RATES[sr_idx] + padding;
-                    if i + frame_len + 2 < bytes.len() {
-                        if bytes[i + frame_len] == 0xFF && (bytes[i + frame_len + 1] & 0xE0) == 0xE0 {
-                            return Some(i);
-                        }
+                    let frame_len =
+                        (144 * BITRATES[bitrate_idx] * 1000) / SAMPLE_RATES[sr_idx] + padding;
+                    if i + frame_len + 2 < bytes.len()
+                        && bytes[i + frame_len] == 0xFF
+                        && (bytes[i + frame_len + 1] & 0xE0) == 0xE0
+                    {
+                        return Some(i);
                     }
                 } else {
                     return Some(i);
