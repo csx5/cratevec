@@ -106,6 +106,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/session/start", post(api_start_session))
         .route("/api/session/bridge", post(api_bridge_seed))
         .route("/api/session/swipe", post(api_swipe))
+        .route("/api/session/undo", post(api_undo))
+        .route("/api/session/negative/remove", post(api_remove_negative))
+        .route("/api/session/crate/remove", post(api_remove_crate))
+        .route("/api/session/more", post(api_load_more))
         .route("/api/session/focus", post(api_focus_track))
         .route("/api/session/corridor", post(api_select_corridor))
         .route("/api/session/weights", post(api_update_weights))
@@ -224,6 +228,64 @@ async fn api_swipe(
     Json(req): Json<SwipeRequest>,
 ) -> Response {
     match state.engine.swipe(&req.track_id, req.direction).await {
+        Ok(snap) => Json(snap).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_undo(State(state): State<AppState>) -> Response {
+    match state.engine.undo_last_swipe() {
+        Ok(snap) => Json(snap).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_remove_negative(
+    State(state): State<AppState>,
+    Json(req): Json<FocusRequest>,
+) -> Response {
+    match state.engine.remove_negative_anchor(&req.track_id) {
+        Ok(snap) => Json(snap).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_remove_crate(
+    State(state): State<AppState>,
+    Json(req): Json<FocusRequest>,
+) -> Response {
+    match state.engine.remove_crate_track(&req.track_id) {
+        Ok(snap) => Json(snap).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_load_more(State(state): State<AppState>) -> Response {
+    match state.engine.load_more_candidates().await {
         Ok(snap) => Json(snap).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

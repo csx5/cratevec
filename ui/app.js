@@ -50,6 +50,9 @@
     bridgeSuggestTimer: null,
     selectedSeedId: null,
     selectedBridgeId: null,
+    isSwiping: false,
+    previewTrack: null,
+    lastVolume: 0.85,
   };
 
   // --- DOM References ---
@@ -70,6 +73,108 @@
   const triangleCanvas = document.getElementById("triangle-canvas");
   const sonicMapCanvas = document.getElementById("sonic-map-canvas");
   const chkAutoDrop = document.getElementById("chk-auto-drop");
+  const btnUndo = document.getElementById("btn-undo");
+  const btnLoadMore = document.getElementById("btn-load-more");
+  const sliderVolume = document.getElementById("slider-volume");
+  const btnMute = document.getElementById("btn-mute");
+  const previewBanner = document.getElementById("preview-banner");
+  const previewBannerText = document.getElementById("preview-banner-text");
+  const toastContainer = document.getElementById("toast-container");
+
+  function releaseFocus() {
+    if (document.activeElement && typeof document.activeElement.blur === "function") {
+      document.activeElement.blur();
+    }
+  }
+
+  function isTextInputElement(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = (el.tagName || "").toUpperCase();
+    if (tag === "TEXTAREA") return true;
+    if (tag === "INPUT") {
+      const type = (el.type || "text").toLowerCase();
+      return !["range", "checkbox", "radio", "button", "submit", "reset"].includes(type);
+    }
+    return false;
+  }
+
+  function showToast(message, kind = "info") {
+    if (!toastContainer) return;
+    const item = document.createElement("div");
+    item.className = `toast-item ${kind === "error" ? "toast-error" : kind === "ok" ? "toast-ok" : ""}`;
+    item.textContent = message;
+    toastContainer.appendChild(item);
+    setTimeout(() => {
+      item.remove();
+    }, 3200);
+  }
+
+  function flashCard(direction) {
+    const cls = `flash-${direction}`;
+    trackCard.classList.remove("flash-left", "flash-right", "flash-up", "flash-down");
+    trackCard.classList.add(cls);
+    setTimeout(() => trackCard.classList.remove(cls), 220);
+  }
+
+  function enterPreviewMode(trackObj) {
+    state.previewTrack = trackObj;
+    if (previewBanner && previewBannerText) {
+      previewBannerText.textContent = `PREVIEW: ${trackObj.meta.artist} - ${trackObj.meta.title}`;
+      previewBanner.classList.remove("hidden");
+    }
+    document.getElementById("drop-time-label").textContent = `${(trackObj.dsp.drop_start_sec || 0).toFixed(1)}s`;
+    loadAndPlayPreview(
+      trackObj.meta.id,
+      trackObj.meta.artist,
+      trackObj.meta.title,
+      trackObj.meta.preview_url,
+      trackObj.dsp.drop_start_sec || 0,
+      true
+    );
+    drawWaveform();
+  }
+
+  function exitPreviewMode(reloadCard = true) {
+    state.previewTrack = null;
+    if (previewBanner) previewBanner.classList.add("hidden");
+    const card = state.snapshot && state.snapshot.current_card;
+    if (card) {
+      document.getElementById("drop-time-label").textContent = `${(card.track.dsp.drop_start_sec || 0).toFixed(1)}s`;
+      drawWaveform();
+      if (reloadCard) {
+        loadAndPlayPreview(
+          card.track.meta.id,
+          card.track.meta.artist,
+          card.track.meta.title,
+          card.track.meta.preview_url,
+          card.track.dsp.drop_start_sec || 0,
+          true
+        );
+      }
+    }
+  }
+
+  function applyVolume(vol) {
+    const clamped = Math.max(0, Math.min(1, vol));
+    audioPlayer.volume = clamped;
+    audioPlayer.muted = clamped === 0;
+    if (sliderVolume) sliderVolume.value = String(Math.round(clamped * 100));
+    if (btnMute) btnMute.textContent = clamped === 0 ? "MUTE" : "VOL";
+    try {
+      localStorage.setItem("cratevec_volume", String(clamped));
+    } catch (_) {}
+  }
+
+  function initVolume() {
+    let saved = 0.85;
+    try {
+      const raw = parseFloat(localStorage.getItem("cratevec_volume"));
+      if (isFinite(raw) && raw >= 0 && raw <= 1) saved = raw;
+    } catch (_) {}
+    state.lastVolume = saved > 0 ? saved : 0.85;
+    applyVolume(saved);
+  }
 
   function setLoading(active, title = "RUST DSP PIPELINE AKTIV", sub = "Analysiere Audio-Vektoren...") {
     loaderTitle.textContent = title;
@@ -104,6 +209,9 @@
     const q = (rawQuery || "").trim();
     if (!q) return;
     hideDropdowns();
+    releaseFocus();
+    state.previewTrack = null;
+    if (previewBanner) previewBanner.classList.add("hidden");
     stopAudioImmediate();
 
     if (displayLabel) {
@@ -112,8 +220,8 @@
 
     setLoading(
       true,
-      "NEUE SESSION // RUST DSP PIPELINE",
-      `Lade Kandidaten & berechne 48-D Audio-Vektoren fuer "${displayLabel || q}"...`
+      "NEUE SESSION // TRACK-RADIO + RUST DSP",
+      `Lade Track-Radio & berechne 48-D Audio-Vektoren fuer "${displayLabel || q}"...`
     );
     try {
       const snap = await apiFetch("/api/session/start", {
@@ -126,8 +234,9 @@
         seedInput.value = `${snap.seeds[0].meta.artist} - ${snap.seeds[0].meta.title}`;
       }
       applySnapshot(snap, true);
+      releaseFocus();
     } catch (err) {
-      alert(`Analyse-Fehler: ${err.message}`);
+      showToast(`Analyse-Fehler: ${err.message}`, "error");
     } finally {
       setLoading(false);
     }
@@ -137,9 +246,12 @@
     const q = (rawQuery || "").trim();
     if (!q) return;
     hideDropdowns();
+    releaseFocus();
     if (!state.snapshot) {
       return startSession(q, displayLabel);
     }
+    state.previewTrack = null;
+    if (previewBanner) previewBanner.classList.add("hidden");
     stopAudioImmediate();
     setLoading(
       true,
@@ -155,25 +267,32 @@
       bridgeInput.value = "";
       state.lastTrackId = null;
       applySnapshot(snap, true);
+      releaseFocus();
+      showToast("Bridge-Anker hinzugefuegt.", "ok");
     } catch (err) {
-      alert(`Bridge-Fehler: ${err.message}`);
+      showToast(`Bridge-Fehler: ${err.message}`, "error");
     } finally {
       setLoading(false);
     }
   }
 
   async function sendSwipe(direction, explicitTrackId = null) {
+    if (state.isSwiping) return;
     const card = state.snapshot && state.snapshot.current_card;
     const trackId = explicitTrackId || (card && card.track.meta.id);
     if (!trackId) return;
 
+    state.isSwiping = true;
+    state.previewTrack = null;
+    if (previewBanner) previewBanner.classList.add("hidden");
+    flashCard(direction);
     stopAudioImmediate();
 
     if (direction === "up") {
       setLoading(
         true,
         "SUPER-SEED DEEP DIVE",
-        "Erweitere Kandidaten-Pool um Nachbarn dieses Tracks..."
+        "Erweitere Kandidaten-Pool um Track-Radio-Nachbarn dieses Songs..."
       );
     }
 
@@ -185,7 +304,78 @@
       state.lastTrackId = null;
       applySnapshot(snap, true);
     } catch (err) {
-      console.error("Swipe failed:", err);
+      showToast(`Swipe fehlgeschlagen: ${err.message}`, "error");
+    } finally {
+      state.isSwiping = false;
+      setLoading(false);
+    }
+  }
+
+  async function undoLastSwipe() {
+    if (state.isSwiping || !state.snapshot || !state.snapshot.can_undo) return;
+    state.isSwiping = true;
+    state.previewTrack = null;
+    if (previewBanner) previewBanner.classList.add("hidden");
+    stopAudioImmediate();
+    try {
+      const snap = await apiFetch("/api/session/undo", { method: "POST" });
+      state.lastTrackId = null;
+      applySnapshot(snap, true);
+      showToast("Letzter Swipe rueckgaengig gemacht.", "info");
+    } catch (err) {
+      showToast(err.message, "error");
+    } finally {
+      state.isSwiping = false;
+    }
+  }
+
+  async function removeNegativeAnchor(trackId) {
+    if (!trackId) return;
+    try {
+      const snap = await apiFetch("/api/session/negative/remove", {
+        method: "POST",
+        body: JSON.stringify({ track_id: trackId }),
+      });
+      applySnapshot(snap, false);
+      showToast("Negativ-Filter entfernt.", "info");
+    } catch (err) {
+      showToast(`Fehler: ${err.message}`, "error");
+    }
+  }
+
+  async function removeCrateTrack(trackId) {
+    if (!trackId) return;
+    try {
+      const snap = await apiFetch("/api/session/crate/remove", {
+        method: "POST",
+        body: JSON.stringify({ track_id: trackId }),
+      });
+      applySnapshot(snap, false);
+      showToast("Track aus Crate entfernt.", "info");
+    } catch (err) {
+      showToast(`Fehler: ${err.message}`, "error");
+    }
+  }
+
+  async function loadMoreCandidates() {
+    if (!state.snapshot || state.isSwiping) return;
+    releaseFocus();
+    setLoading(
+      true,
+      "POOL ERWEITERN // TRACK-RADIO",
+      "Suche frische Nachbarn fuer deinen aktuellen Vibe..."
+    );
+    try {
+      const before = state.snapshot.pool_size || 0;
+      const snap = await apiFetch("/api/session/more", { method: "POST" });
+      const added = Math.max(0, (snap.pool_size || 0) - before);
+      applySnapshot(snap, false);
+      showToast(
+        added > 0 ? `${added} neue Kandidaten in den Pool geladen.` : "Keine weiteren neuen Kandidaten gefunden.",
+        added > 0 ? "ok" : "info"
+      );
+    } catch (err) {
+      showToast(`Nachladen fehlgeschlagen: ${err.message}`, "error");
     } finally {
       setLoading(false);
     }
@@ -239,7 +429,56 @@
 
   // --- Autocomplete Search for Seed & Bridge Inputs ---
   function setupAutocomplete(inputEl, dropdownEl, isBridge) {
+    let activeIdx = -1;
+
+    function updateHighlight() {
+      const items = dropdownEl.querySelectorAll(".suggest-item");
+      items.forEach((el, idx) => {
+        el.classList.toggle("active", idx === activeIdx);
+      });
+    }
+
+    function pickItem(el) {
+      if (!el) return;
+      const id = el.getAttribute("data-id");
+      const label = el.getAttribute("data-label");
+      dropdownEl.classList.add("hidden");
+      activeIdx = -1;
+      inputEl.blur();
+      if (isBridge) {
+        addBridgeSeed(id, label);
+      } else {
+        startSession(id, label);
+      }
+    }
+
+    inputEl.addEventListener("keydown", (e) => {
+      const isOpen = !dropdownEl.classList.contains("hidden");
+      const items = dropdownEl.querySelectorAll(".suggest-item");
+      if (e.key === "Escape") {
+        dropdownEl.classList.add("hidden");
+        activeIdx = -1;
+        inputEl.blur();
+        return;
+      }
+      if (!isOpen || items.length === 0) return;
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        activeIdx = (activeIdx + 1) % items.length;
+        updateHighlight();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        activeIdx = (activeIdx - 1 + items.length) % items.length;
+        updateHighlight();
+      } else if (e.key === "Enter" && activeIdx >= 0 && items[activeIdx]) {
+        e.preventDefault();
+        pickItem(items[activeIdx]);
+      }
+    });
+
     inputEl.addEventListener("input", () => {
+      activeIdx = -1;
       if (isBridge) state.selectedBridgeId = null;
       else state.selectedSeedId = null;
 
@@ -259,6 +498,7 @@
             dropdownEl.classList.add("hidden");
             return;
           }
+          activeIdx = -1;
           dropdownEl.innerHTML = items
             .slice(0, 7)
             .map(
@@ -278,14 +518,7 @@
           dropdownEl.querySelectorAll(".suggest-item").forEach((el) => {
             el.addEventListener("mousedown", (ev) => {
               ev.preventDefault();
-              const id = el.getAttribute("data-id");
-              const label = el.getAttribute("data-label");
-              dropdownEl.classList.add("hidden");
-              if (isBridge) {
-                addBridgeSeed(id, label);
-              } else {
-                startSession(id, label);
-              }
+              pickItem(el);
             });
           });
         } catch (_) {
@@ -295,7 +528,10 @@
     });
 
     inputEl.addEventListener("blur", () => {
-      setTimeout(() => dropdownEl.classList.add("hidden"), 160);
+      setTimeout(() => {
+        dropdownEl.classList.add("hidden");
+        activeIdx = -1;
+      }, 160);
     });
   }
 
@@ -314,6 +550,7 @@
     document.getElementById("seed-count-badge").textContent = snap.seeds.length;
     document.getElementById("crate-count-badge").textContent = snap.liked_crate.length;
     document.getElementById("neg-count-badge").textContent = snap.negative_anchors.length;
+    if (btnUndo) btnUndo.disabled = !snap.can_undo;
 
     renderSeeds(snap.seeds);
     renderNegativeAnchors(snap.negative_anchors);
@@ -360,6 +597,7 @@
 
     bar.querySelectorAll(".corridor-chip").forEach((btn) => {
       btn.addEventListener("click", () => {
+        btn.blur();
         const cid = btn.getAttribute("data-corridor");
         if (cid) selectCorridor(cid);
       });
@@ -374,8 +612,8 @@
     }
     container.innerHTML = seeds
       .map(
-        (s) => `
-      <div class="seed-item queue-clickable" data-play-id="${escapeHtml(s.meta.id)}" data-artist="${escapeHtml(s.meta.artist)}" data-title="${escapeHtml(s.meta.title)}" data-url="${escapeHtml(s.meta.preview_url)}" data-drop="${s.dsp.drop_start_sec}" title="Klicken zum Anspielen des Seed-Tracks">
+        (s, idx) => `
+      <div class="seed-item queue-clickable" data-seed-idx="${idx}" title="Klicken zum Anspielen des Seed-Tracks">
         <img src="${escapeHtml(s.meta.cover_url)}" alt="">
         <div class="seed-info">
           <div class="seed-title">${escapeHtml(s.meta.artist)} - ${escapeHtml(s.meta.title)}</div>
@@ -388,14 +626,8 @@
 
     container.querySelectorAll(".seed-item").forEach((el) => {
       el.addEventListener("click", () => {
-        loadAndPlayPreview(
-          el.getAttribute("data-play-id"),
-          el.getAttribute("data-artist"),
-          el.getAttribute("data-title"),
-          el.getAttribute("data-url"),
-          parseFloat(el.getAttribute("data-drop") || "0"),
-          true
-        );
+        const idx = parseInt(el.getAttribute("data-seed-idx"), 10);
+        if (seeds[idx]) enterPreviewMode(seeds[idx]);
       });
     });
   }
@@ -411,11 +643,22 @@
         (n) => `
       <div class="neg-item">
         <span>${escapeHtml(n.meta.artist)} - ${escapeHtml(n.meta.title)}</span>
-        <span class="mono-badge">${n.dsp.bpm.toFixed(0)} BPM</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span class="mono-badge">${n.dsp.bpm.toFixed(0)} BPM</span>
+          <button type="button" class="remove-x-btn" data-remove-neg="${escapeHtml(n.meta.id)}" title="Filter entfernen">X</button>
+        </div>
       </div>
     `
       )
       .join("");
+
+    container.querySelectorAll("[data-remove-neg]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        btn.blur();
+        removeNegativeAnchor(btn.getAttribute("data-remove-neg"));
+      });
+    });
   }
 
   function renderCrate(crate) {
@@ -424,18 +667,18 @@
       container.innerHTML = `<div class="empty-hint">Nach rechts oder oben geswipte Songs landen hier.</div>`;
       return;
     }
-    container.innerHTML = crate
-      .slice()
-      .reverse()
+    const reversed = crate.slice().reverse();
+    container.innerHTML = reversed
       .map(
-        (t) => `
-      <div class="list-track queue-clickable" data-play-id="${escapeHtml(t.meta.id)}" data-artist="${escapeHtml(t.meta.artist)}" data-title="${escapeHtml(t.meta.title)}" data-url="${escapeHtml(t.meta.preview_url)}" data-drop="${t.dsp.drop_start_sec}" title="Klicken zum Anspielen">
+        (t, idx) => `
+      <div class="list-track queue-clickable" data-crate-idx="${idx}" title="Klicken zum Anspielen">
         <img src="${escapeHtml(t.meta.cover_url)}" alt="">
         <div class="list-track-meta">
           <div class="list-track-title">${escapeHtml(t.meta.artist)} - ${escapeHtml(t.meta.title)}</div>
           <div class="list-track-sub">${t.dsp.bpm.toFixed(0)} BPM | Drop @ ${t.dsp.drop_start_sec.toFixed(1)}s</div>
         </div>
         <a href="${escapeHtml(t.meta.spotify_search_url)}" target="_blank" rel="noopener" class="ext-link" onclick="event.stopPropagation()">SPOTIFY</a>
+        <button type="button" class="remove-x-btn" data-remove-crate="${escapeHtml(t.meta.id)}" title="Aus Crate entfernen">X</button>
       </div>
     `
       )
@@ -443,14 +686,16 @@
 
     container.querySelectorAll(".list-track").forEach((el) => {
       el.addEventListener("click", () => {
-        loadAndPlayPreview(
-          el.getAttribute("data-play-id"),
-          el.getAttribute("data-artist"),
-          el.getAttribute("data-title"),
-          el.getAttribute("data-url"),
-          parseFloat(el.getAttribute("data-drop") || "0"),
-          true
-        );
+        const idx = parseInt(el.getAttribute("data-crate-idx"), 10);
+        if (reversed[idx]) enterPreviewMode(reversed[idx]);
+      });
+    });
+
+    container.querySelectorAll("[data-remove-crate]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        btn.blur();
+        removeCrateTrack(btn.getAttribute("data-remove-crate"));
       });
     });
   }
@@ -564,14 +809,15 @@
     const h = waveformCanvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    const card = state.snapshot && state.snapshot.current_card;
-    if (!card) return;
+    const activeTrack =
+      state.previewTrack || (state.snapshot && state.snapshot.current_card && state.snapshot.current_card.track);
+    if (!activeTrack) return;
 
-    const peaks = card.track.dsp.waveform_peaks || [];
+    const peaks = activeTrack.dsp.waveform_peaks || [];
     const n = peaks.length || 64;
     const dur = audioPlayer.duration && isFinite(audioPlayer.duration) ? audioPlayer.duration : 30.0;
     const cur = audioPlayer.currentTime || 0.0;
-    const dropSec = card.track.dsp.drop_start_sec || 0.0;
+    const dropSec = activeTrack.dsp.drop_start_sec || 0.0;
 
     const barW = w / n;
     const progressRatio = cur / dur;
@@ -927,23 +1173,27 @@
   // --- Form Submissions & Controls ---
   seedForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    seedInput.blur();
     startSession(state.selectedSeedId || seedInput.value);
   });
 
   bridgeForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    bridgeInput.blur();
     addBridgeSeed(state.selectedBridgeId || bridgeInput.value);
   });
 
   document.querySelectorAll(".quick-seed-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
+      btn.blur();
       const s = btn.getAttribute("data-seed");
       seedInput.value = s;
       startSession(s);
     });
   });
 
-  document.getElementById("btn-play-toggle").addEventListener("click", () => {
+  document.getElementById("btn-play-toggle").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     if (audioPlayer.paused) {
       audioPlayer.play().catch(() => {});
     } else {
@@ -951,38 +1201,136 @@
     }
   });
 
-  document.getElementById("btn-jump-drop").addEventListener("click", () => {
-    const card = state.snapshot && state.snapshot.current_card;
-    if (!card) return;
-    audioPlayer.currentTime = card.track.dsp.drop_start_sec || 0;
+  document.getElementById("btn-jump-drop").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    const activeTrack =
+      state.previewTrack || (state.snapshot && state.snapshot.current_card && state.snapshot.current_card.track);
+    if (!activeTrack) return;
+    audioPlayer.currentTime = activeTrack.dsp.drop_start_sec || 0;
     audioPlayer.play().catch(() => {});
   });
 
-  document.getElementById("btn-swipe-left").addEventListener("click", () => sendSwipe("left"));
-  document.getElementById("btn-swipe-right").addEventListener("click", () => sendSwipe("right"));
-  document.getElementById("btn-swipe-up").addEventListener("click", () => sendSwipe("up"));
-  document.getElementById("btn-swipe-down").addEventListener("click", () => sendSwipe("down"));
+  if (btnUndo) {
+    btnUndo.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      undoLastSwipe();
+    });
+  }
+
+  if (btnLoadMore) {
+    btnLoadMore.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      loadMoreCandidates();
+    });
+  }
+
+  const btnExitPreview = document.getElementById("btn-exit-preview");
+  if (btnExitPreview) {
+    btnExitPreview.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      exitPreviewMode(true);
+    });
+  }
+
+  if (sliderVolume) {
+    sliderVolume.addEventListener("input", () => {
+      const v = parseInt(sliderVolume.value, 10) / 100;
+      if (v > 0) state.lastVolume = v;
+      applyVolume(v);
+    });
+    sliderVolume.addEventListener("change", () => sliderVolume.blur());
+  }
+
+  if (btnMute) {
+    btnMute.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      if (audioPlayer.volume > 0 && !audioPlayer.muted) {
+        state.lastVolume = audioPlayer.volume;
+        applyVolume(0);
+      } else {
+        applyVolume(state.lastVolume || 0.85);
+      }
+    });
+  }
+
+  chkAutoDrop.addEventListener("change", () => chkAutoDrop.blur());
+  ugSlider.addEventListener("change", () => ugSlider.blur());
+
+  document.getElementById("btn-swipe-left").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    sendSwipe("left");
+  });
+  document.getElementById("btn-swipe-right").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    sendSwipe("right");
+  });
+  document.getElementById("btn-swipe-up").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    sendSwipe("up");
+  });
+  document.getElementById("btn-swipe-down").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    sendSwipe("down");
+  });
 
   window.addEventListener("keydown", (e) => {
-    const tag = (e.target && e.target.tagName) || "";
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    // Global Escape: close modal, dropdowns, exit preview or blur input
+    if (e.key === "Escape") {
+      if (!nodeModal.classList.contains("hidden")) {
+        nodeModal.classList.add("hidden");
+        releaseFocus();
+        return;
+      }
+      hideDropdowns();
+      if (isTextInputElement(document.activeElement)) {
+        releaseFocus();
+        return;
+      }
+      if (state.previewTrack) {
+        exitPreviewMode(true);
+        return;
+      }
+    }
 
-    if (e.code === "Space") {
+    // Ctrl+K jumps straight to search even from inputs
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
+      seedInput.focus();
+      seedInput.select();
+      return;
+    }
+
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (isTextInputElement(e.target) || isTextInputElement(document.activeElement)) return;
+    if (!nodeModal.classList.contains("hidden")) return;
+
+    if (e.key === "/") {
+      e.preventDefault();
+      seedInput.focus();
+      seedInput.select();
+    } else if (e.code === "Space") {
+      e.preventDefault();
+      releaseFocus();
       if (audioPlayer.paused) audioPlayer.play().catch(() => {});
       else audioPlayer.pause();
-    } else if (e.key === "ArrowRight" || e.key === "d" || e.key === "l") {
+    } else if (e.key === "ArrowRight" || e.key === "d" || e.key === "D" || e.key === "l") {
       e.preventDefault();
       sendSwipe("right");
-    } else if (e.key === "ArrowLeft" || e.key === "a" || e.key === "h") {
+    } else if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A" || e.key === "h") {
       e.preventDefault();
       sendSwipe("left");
-    } else if (e.key === "ArrowUp" || e.key === "w" || e.key === "k") {
+    } else if (e.key === "ArrowUp" || e.key === "w" || e.key === "W" || e.key === "k") {
       e.preventDefault();
       sendSwipe("up");
-    } else if (e.key === "ArrowDown" || e.key === "s" || e.key === "j") {
+    } else if (e.key === "ArrowDown" || e.key === "s" || e.key === "S" || e.key === "j") {
       e.preventDefault();
       sendSwipe("down");
+    } else if (e.key === "z" || e.key === "Z" || e.key === "Backspace") {
+      e.preventDefault();
+      undoLastSwipe();
+    } else if (e.key === "m" || e.key === "M") {
+      e.preventDefault();
+      if (btnMute) btnMute.click();
     } else if (e.key === "r" || e.key === "R") {
       e.preventDefault();
       document.getElementById("btn-jump-drop").click();
@@ -1022,33 +1370,38 @@
   });
 
   // --- Crate Exports ---
-  document.getElementById("btn-export-spotify").addEventListener("click", () => {
+  document.getElementById("btn-export-spotify").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     const crate = (state.snapshot && state.snapshot.liked_crate) || [];
-    if (!crate.length) return alert("Die Crate ist noch leer.");
+    if (!crate.length) return showToast("Die Crate ist noch leer.", "info");
     const lines = crate.map(
       (t) => `${t.meta.artist} - ${t.meta.title} | ${t.meta.spotify_search_url}`
     );
     navigator.clipboard.writeText(lines.join("\n")).then(() => {
-      alert(`${crate.length} Tracks + Spotify-Suchlinks in die Zwischenablage kopiert.`);
+      showToast(`${crate.length} Tracks + Spotify-Suchlinks kopiert.`, "ok");
     });
   });
 
-  document.getElementById("btn-export-m3u").addEventListener("click", () => {
+  document.getElementById("btn-export-m3u").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     const crate = (state.snapshot && state.snapshot.liked_crate) || [];
-    if (!crate.length) return alert("Die Crate ist noch leer.");
+    if (!crate.length) return showToast("Die Crate ist noch leer.", "info");
     let m3u = "#EXTM3U\n";
     for (const t of crate) {
       m3u += `#EXTINF:${t.meta.duration_sec || 180},${t.meta.artist} - ${t.meta.title}\n`;
       m3u += `${t.meta.external_url || t.meta.spotify_search_url}\n`;
     }
     downloadBlob(m3u, "cratevec_session.m3u8", "audio/x-mpegurl");
+    showToast(`${crate.length} Tracks als .m3u8 exportiert.`, "ok");
   });
 
-  document.getElementById("btn-export-json").addEventListener("click", () => {
+  document.getElementById("btn-export-json").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     const crate = (state.snapshot && state.snapshot.liked_crate) || [];
-    if (!crate.length) return alert("Die Crate ist noch leer.");
+    if (!crate.length) return showToast("Die Crate ist noch leer.", "info");
     const data = JSON.stringify(crate, null, 2);
     downloadBlob(data, "cratevec_session.json", "application/json");
+    showToast(`${crate.length} Tracks als JSON exportiert.`, "ok");
   });
 
   function downloadBlob(content, filename, mime) {
@@ -1085,8 +1438,9 @@
     nodeModal.classList.add("hidden");
     try {
       await apiFetch("/api/status");
+      showToast(`Verbunden mit ${val || "LOCAL :7420"}.`, "ok");
     } catch (err) {
-      alert(`Server unter "${val || "lokal"}" nicht erreichbar: ${err.message}`);
+      showToast(`Server unter "${val || "lokal"}" nicht erreichbar: ${err.message}`, "error");
     }
   });
 
@@ -1099,6 +1453,7 @@
   }
 
   // --- Initialization ---
+  initVolume();
   updateNodeLabel();
   drawTriangleMixer();
 

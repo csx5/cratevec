@@ -74,3 +74,8 @@ docker compose up --build -d
 | `Unten` / `S` / `J` | Kill Vibe (Negativ-Filter setzen) |
 | `Leertaste` | Play / Pause |
 | `R` | Direkt zum erkannten Beat-Drop springen |
+| `Z` / `Backspace` | Letzten Swipe rueckgaengig machen (Undo) |
+| `1` - `4` | Zwischen den 4 Vibe-Korridoren wechseln |
+| `/` / `Strg+K` | Direkt in die Seed-Suche springen |
+| `M` | Audio stummschalten (Mute) |
+| `Esc` | Suche, Dropdowns, Modals oder Preview verlassen |

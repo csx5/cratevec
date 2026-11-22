@@ -141,6 +141,8 @@ pub struct SessionSnapshot {
     pub current_card: Option<ScoredCandidate>,
     pub queue_preview: Vec<ScoredCandidate>,
     pub map_points: Vec<SonicMapPoint>,
+    #[serde(default)]
+    pub can_undo: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

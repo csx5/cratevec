@@ -117,6 +117,7 @@
         <div class="pool-telemetry">
           <span>POOL: <strong id="stat-pool">0</strong></span>
           <span>GEPRUEFT: <strong id="stat-seen">0</strong></span>
+          <button type="button" id="btn-load-more" class="btn btn-small" title="Frische Track-Radio-Nachbarn in den Pool laden">+ MEHR</button>
         </div>
       </div>
 
@@ -186,16 +187,27 @@
 
           <!-- Waveform & Drop-Sniper Player -->
           <div class="player-box">
+            <div id="preview-banner" class="preview-banner hidden">
+              <span id="preview-banner-text">PREVIEW: --</span>
+              <button type="button" id="btn-exit-preview" class="btn btn-small">ZURUECK ZUR KARTE</button>
+            </div>
             <div class="player-header">
               <div class="player-controls">
                 <button type="button" id="btn-play-toggle" class="btn btn-small">PLAY [SPACE]</button>
                 <button type="button" id="btn-jump-drop" class="btn btn-small">DROP [<span id="drop-time-label">0.0s</span>]</button>
+                <button type="button" id="btn-undo" class="btn btn-small" disabled title="Letzten Swipe rueckgaengig machen (Z / Backspace)">UNDO [Z]</button>
               </div>
-              <label class="drop-sniper-toggle">
-                <input type="checkbox" id="chk-auto-drop" checked>
-                <span>DROP-SNIPER AUTO-SEEK</span>
-              </label>
-              <span id="player-time" class="mono-time">00.0s / 30.0s</span>
+              <div class="player-right-controls">
+                <div class="volume-control" title="Lautstaerke (Taste M fuer Mute)">
+                  <button type="button" id="btn-mute" class="btn btn-small">VOL</button>
+                  <input id="slider-volume" type="range" min="0" max="100" value="85">
+                </div>
+                <label class="drop-sniper-toggle">
+                  <input type="checkbox" id="chk-auto-drop" checked>
+                  <span>AUTO-DROP</span>
+                </label>
+                <span id="player-time" class="mono-time">00.0s / 30.0s</span>
+              </div>
             </div>
             <canvas id="waveform-canvas" width="620" height="76"></canvas>
             <audio id="audio-player" preload="auto"></audio>
@@ -289,6 +301,8 @@
       </div>
     </div>
   </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
   <script src="/app.js"></script>
 </body>

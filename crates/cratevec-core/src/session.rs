@@ -8,6 +8,158 @@ use crate::models::{
 use crate::trainer::TrainedMetricModel;
 
 #[derive(Debug, Clone)]
+struct FeatureScaler {
+    enabled: bool,
+    mean_b: [f32; 16],
+    std_b: [f32; 16],
+    mean_v: [f32; 16],
+    std_v: [f32; 16],
+    mean_a: [f32; 16],
+    std_a: [f32; 16],
+    mean_aggr: f32,
+    std_aggr: f32,
+    mean_dark: f32,
+    std_dark: f32,
+}
+
+impl Default for FeatureScaler {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mean_b: [0.0; 16],
+            std_b: [1.0; 16],
+            mean_v: [0.0; 16],
+            std_v: [1.0; 16],
+            mean_a: [0.0; 16],
+            std_a: [1.0; 16],
+            mean_aggr: 0.5,
+            std_aggr: 0.15,
+            mean_dark: 0.5,
+            std_dark: 0.15,
+        }
+    }
+}
+
+impl FeatureScaler {
+    fn fit_and_apply(seeds: &mut [AnalyzedTrack], pool: &mut [AnalyzedTrack]) -> Self {
+        let total = seeds.len() + pool.len();
+        if total < 4 {
+            for t in seeds.iter_mut().chain(pool.iter_mut()) {
+                l2_normalize_in_place(&mut t.dsp.v_beat);
+                l2_normalize_in_place(&mut t.dsp.v_vocal);
+                l2_normalize_in_place(&mut t.dsp.v_atmo);
+            }
+            return Self::default();
+        }
+
+        let n = total as f32;
+        let mut s = Self {
+            enabled: true,
+            ..Self::default()
+        };
+        s.mean_aggr = 0.0;
+        s.mean_dark = 0.0;
+
+        for t in seeds.iter().chain(pool.iter()) {
+            for j in 0..16 {
+                s.mean_b[j] += t.dsp.v_beat.get(j).copied().unwrap_or(0.0);
+                s.mean_v[j] += t.dsp.v_vocal.get(j).copied().unwrap_or(0.0);
+                s.mean_a[j] += t.dsp.v_atmo.get(j).copied().unwrap_or(0.0);
+            }
+            s.mean_aggr += t.dsp.aggression_index;
+            s.mean_dark += t.dsp.darkness_index;
+        }
+        for j in 0..16 {
+            s.mean_b[j] /= n;
+            s.mean_v[j] /= n;
+            s.mean_a[j] /= n;
+        }
+        s.mean_aggr /= n;
+        s.mean_dark /= n;
+
+        let mut var_b = [0.0f32; 16];
+        let mut var_v = [0.0f32; 16];
+        let mut var_a = [0.0f32; 16];
+        let mut var_aggr = 0.0f32;
+        let mut var_dark = 0.0f32;
+
+        for t in seeds.iter().chain(pool.iter()) {
+            for j in 0..16 {
+                let db = t.dsp.v_beat.get(j).copied().unwrap_or(0.0) - s.mean_b[j];
+                let dv = t.dsp.v_vocal.get(j).copied().unwrap_or(0.0) - s.mean_v[j];
+                let da = t.dsp.v_atmo.get(j).copied().unwrap_or(0.0) - s.mean_a[j];
+                var_b[j] += db * db;
+                var_v[j] += dv * dv;
+                var_a[j] += da * da;
+            }
+            let dag = t.dsp.aggression_index - s.mean_aggr;
+            let ddk = t.dsp.darkness_index - s.mean_dark;
+            var_aggr += dag * dag;
+            var_dark += ddk * ddk;
+        }
+        for j in 0..16 {
+            s.std_b[j] = (var_b[j] / n).sqrt().max(0.05);
+            s.std_v[j] = (var_v[j] / n).sqrt().max(0.05);
+            s.std_a[j] = (var_a[j] / n).sqrt().max(0.05);
+        }
+        s.std_aggr = (var_aggr / n).sqrt().max(0.06);
+        s.std_dark = (var_dark / n).sqrt().max(0.06);
+
+        for t in seeds.iter_mut().chain(pool.iter_mut()) {
+            s.transform_track(t);
+        }
+        s
+    }
+
+    fn transform_track(&self, t: &mut AnalyzedTrack) {
+        if self.enabled {
+            for j in 0..16 {
+                if let Some(vb) = t.dsp.v_beat.get_mut(j) {
+                    *vb = ((*vb - self.mean_b[j]) / self.std_b[j]).clamp(-2.6, 2.6);
+                }
+                if let Some(vv) = t.dsp.v_vocal.get_mut(j) {
+                    *vv = ((*vv - self.mean_v[j]) / self.std_v[j]).clamp(-2.6, 2.6);
+                }
+                if let Some(va) = t.dsp.v_atmo.get_mut(j) {
+                    *va = ((*va - self.mean_a[j]) / self.std_a[j]).clamp(-2.6, 2.6);
+                }
+            }
+            // Keep 78% absolute physical mood calibration so a calm pool never artificially inflates
+            // aggression_index into "90% aggressive", while adding 22% gentle contrast within the pool.
+            let z_aggr = (t.dsp.aggression_index - self.mean_aggr) / self.std_aggr;
+            let z_dark = (t.dsp.darkness_index - self.mean_dark) / self.std_dark;
+            let cal_aggr =
+                0.78 * t.dsp.aggression_index + 0.22 * (0.50 + 0.42 * (0.75 * z_aggr).tanh());
+            let cal_dark =
+                0.78 * t.dsp.darkness_index + 0.22 * (0.50 + 0.42 * (0.75 * z_dark).tanh());
+            t.dsp.aggression_index = (cal_aggr.clamp(0.04, 0.96) * 100.0).round() / 100.0;
+            t.dsp.darkness_index = (cal_dark.clamp(0.04, 0.96) * 100.0).round() / 100.0;
+        }
+
+        l2_normalize_in_place(&mut t.dsp.v_beat);
+        l2_normalize_in_place(&mut t.dsp.v_vocal);
+        l2_normalize_in_place(&mut t.dsp.v_atmo);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UndoEntry {
+    undone_track_id: String,
+    seeds: Vec<AnalyzedTrack>,
+    liked_crate: Vec<AnalyzedTrack>,
+    negative_anchors: Vec<AnalyzedTrack>,
+    seen_ids: HashSet<String>,
+    seen_dedups: HashSet<String>,
+    metric_model: TrainedMetricModel,
+    target_beat: Vec<f32>,
+    target_vocal: Vec<f32>,
+    target_atmo: Vec<f32>,
+    target_bpm: f32,
+    target_aggression: f32,
+    target_darkness: f32,
+}
+
+#[derive(Debug, Clone)]
 pub struct DiscoverySession {
     pub session_id: String,
     pub seeds: Vec<AnalyzedTrack>,
@@ -27,6 +179,9 @@ pub struct DiscoverySession {
     pub target_bpm: f32,
     pub target_aggression: f32,
     pub target_darkness: f32,
+    scaler: FeatureScaler,
+    undo_stack: Vec<UndoEntry>,
+    pub likes_since_replenish: usize,
 }
 
 impl DiscoverySession {
@@ -54,7 +209,7 @@ impl DiscoverySession {
             }
         }
 
-        whiten_tracks(&mut seeds, &mut deduped_pool);
+        let scaler = FeatureScaler::fit_and_apply(&mut seeds, &mut deduped_pool);
 
         let (target_beat, target_vocal, target_atmo, target_bpm, target_aggression, target_darkness) =
             compute_seed_centroid(&seeds);
@@ -78,6 +233,9 @@ impl DiscoverySession {
             target_bpm,
             target_aggression,
             target_darkness,
+            scaler,
+            undo_stack: Vec::new(),
+            likes_since_replenish: 0,
         }
     }
 
@@ -86,9 +244,7 @@ impl DiscoverySession {
             self.pool.iter().map(|t| t.meta.dedup_key.clone()).collect();
 
         for t in &mut tracks {
-            l2_normalize_in_place(&mut t.dsp.v_beat);
-            l2_normalize_in_place(&mut t.dsp.v_vocal);
-            l2_normalize_in_place(&mut t.dsp.v_atmo);
+            self.scaler.transform_track(t);
         }
 
         for t in tracks {
@@ -100,7 +256,8 @@ impl DiscoverySession {
         }
     }
 
-    pub fn add_bridge_seed(&mut self, seed: AnalyzedTrack, new_candidates: Vec<AnalyzedTrack>) {
+    pub fn add_bridge_seed(&mut self, mut seed: AnalyzedTrack, new_candidates: Vec<AnalyzedTrack>) {
+        self.scaler.transform_track(&mut seed);
         self.seen_ids.insert(seed.meta.id.clone());
         self.seen_dedups.insert(seed.meta.dedup_key.clone());
         if !self
@@ -110,15 +267,91 @@ impl DiscoverySession {
         {
             self.seeds.push(seed);
         }
-        let (tb, tv, ta, bpm, aggr, dark) = compute_seed_centroid(&self.seeds);
+        self.recompute_targets_from_state();
+        self.pinned_track_id = None;
+        self.extend_pool(new_candidates);
+    }
+
+    pub fn remaining_unseen_count(&self) -> usize {
+        self.pool
+            .iter()
+            .filter(|t| {
+                !self.seen_ids.contains(&t.meta.id)
+                    && !self.seen_dedups.contains(&t.meta.dedup_key)
+            })
+            .count()
+    }
+
+    pub fn latest_liked_or_seed(&self) -> Option<AnalyzedTrack> {
+        self.liked_crate
+            .last()
+            .cloned()
+            .or_else(|| self.seeds.last().cloned())
+    }
+
+    pub fn undo_last_swipe(&mut self) -> bool {
+        let Some(entry) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.seeds = entry.seeds;
+        self.liked_crate = entry.liked_crate;
+        self.negative_anchors = entry.negative_anchors;
+        self.seen_ids = entry.seen_ids;
+        self.seen_dedups = entry.seen_dedups;
+        self.metric_model = entry.metric_model;
+        self.target_beat = entry.target_beat;
+        self.target_vocal = entry.target_vocal;
+        self.target_atmo = entry.target_atmo;
+        self.target_bpm = entry.target_bpm;
+        self.target_aggression = entry.target_aggression;
+        self.target_darkness = entry.target_darkness;
+        self.pinned_track_id = Some(entry.undone_track_id);
+        true
+    }
+
+    pub fn remove_negative_anchor(&mut self, track_id: &str) -> bool {
+        let before = self.negative_anchors.len();
+        self.negative_anchors.retain(|n| n.meta.id != track_id);
+        if self.negative_anchors.len() == before {
+            return false;
+        }
+        self.recompute_targets_from_state();
+        true
+    }
+
+    pub fn remove_crate_track(&mut self, track_id: &str) -> bool {
+        let before = self.liked_crate.len();
+        self.liked_crate.retain(|t| t.meta.id != track_id);
+        if self.liked_crate.len() == before {
+            return false;
+        }
+        self.recompute_targets_from_state();
+        true
+    }
+
+    fn recompute_targets_from_state(&mut self) {
+        let (mut tb, mut tv, mut ta, mut bpm, mut aggr, mut dark) =
+            compute_seed_centroid(&self.seeds);
+        let (sb, sv, sa) = (tb.clone(), tv.clone(), ta.clone());
+        for liked in &self.liked_crate {
+            tb = rocchio_step(&tb, &liked.dsp.v_beat, 0.20);
+            tv = rocchio_step(&tv, &liked.dsp.v_vocal, 0.20);
+            ta = rocchio_step(&ta, &liked.dsp.v_atmo, 0.20);
+            bpm = bpm * 0.85 + liked.dsp.bpm * 0.15;
+            aggr = aggr * 0.85 + liked.dsp.aggression_index * 0.15;
+            dark = dark * 0.85 + liked.dsp.darkness_index * 0.15;
+        }
+        for neg in &self.negative_anchors {
+            tb = gram_schmidt_repel(&tb, &sb, &neg.dsp.v_beat);
+            tv = gram_schmidt_repel(&tv, &sv, &neg.dsp.v_vocal);
+            ta = gram_schmidt_repel(&ta, &sa, &neg.dsp.v_atmo);
+        }
         self.target_beat = tb;
         self.target_vocal = tv;
         self.target_atmo = ta;
         self.target_bpm = bpm;
         self.target_aggression = aggr;
         self.target_darkness = dark;
-        self.pinned_track_id = None;
-        self.extend_pool(new_candidates);
     }
 
     pub fn update_weights(&mut self, weights: MixerWeights) {
@@ -168,6 +401,26 @@ impl DiscoverySession {
     ) -> Option<AnalyzedTrack> {
         let track = self.pool.iter().find(|t| t.meta.id == track_id).cloned()?;
 
+        // Push current state onto undo stack (capped at 20 steps)
+        if self.undo_stack.len() >= 20 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(UndoEntry {
+            undone_track_id: track.meta.id.clone(),
+            seeds: self.seeds.clone(),
+            liked_crate: self.liked_crate.clone(),
+            negative_anchors: self.negative_anchors.clone(),
+            seen_ids: self.seen_ids.clone(),
+            seen_dedups: self.seen_dedups.clone(),
+            metric_model: self.metric_model.clone(),
+            target_beat: self.target_beat.clone(),
+            target_vocal: self.target_vocal.clone(),
+            target_atmo: self.target_atmo.clone(),
+            target_bpm: self.target_bpm,
+            target_aggression: self.target_aggression,
+            target_darkness: self.target_darkness,
+        });
+
         self.seen_ids.insert(track.meta.id.clone());
         self.seen_dedups.insert(track.meta.dedup_key.clone());
         if self.pinned_track_id.as_deref() == Some(track_id) {
@@ -199,6 +452,7 @@ impl DiscoverySession {
                 {
                     self.liked_crate.push(track);
                 }
+                self.likes_since_replenish += 1;
                 None
             }
             SwipeDirection::Left => {
@@ -805,6 +1059,7 @@ impl DiscoverySession {
             current_card,
             queue_preview,
             map_points,
+            can_undo: !self.undo_stack.is_empty(),
         }
     }
 }
@@ -918,100 +1173,5 @@ fn l2_normalize_in_place(v: &mut [f32]) {
     let norm = v.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-6);
     for x in v {
         *x /= norm;
-    }
-}
-
-/// Empirical Pool-Relative Z-Score Whitening:
-/// Centers all 48 acoustic dimensions across the session's active seeds + candidate pool
-/// to exact mean 0.0 and variance 1.0 before L2-normalizing, guaranteeing that no dimension
-/// can ever saturate and that aggressive vs. calm / dark vs. bright tracks have opposite signs.
-fn whiten_tracks(seeds: &mut [AnalyzedTrack], pool: &mut [AnalyzedTrack]) {
-    let total = seeds.len() + pool.len();
-    if total < 4 {
-        for t in seeds.iter_mut().chain(pool.iter_mut()) {
-            l2_normalize_in_place(&mut t.dsp.v_beat);
-            l2_normalize_in_place(&mut t.dsp.v_vocal);
-            l2_normalize_in_place(&mut t.dsp.v_atmo);
-        }
-        return;
-    }
-
-    let n = total as f32;
-    let mut mean_b = [0.0f32; 16];
-    let mut mean_v = [0.0f32; 16];
-    let mut mean_a = [0.0f32; 16];
-    let mut mean_aggr = 0.0f32;
-    let mut mean_dark = 0.0f32;
-
-    for t in seeds.iter().chain(pool.iter()) {
-        for j in 0..16 {
-            mean_b[j] += t.dsp.v_beat.get(j).copied().unwrap_or(0.0);
-            mean_v[j] += t.dsp.v_vocal.get(j).copied().unwrap_or(0.0);
-            mean_a[j] += t.dsp.v_atmo.get(j).copied().unwrap_or(0.0);
-        }
-        mean_aggr += t.dsp.aggression_index;
-        mean_dark += t.dsp.darkness_index;
-    }
-    for j in 0..16 {
-        mean_b[j] /= n;
-        mean_v[j] /= n;
-        mean_a[j] /= n;
-    }
-    mean_aggr /= n;
-    mean_dark /= n;
-
-    let mut std_b = [0.0f32; 16];
-    let mut std_v = [0.0f32; 16];
-    let mut std_a = [0.0f32; 16];
-    let mut var_aggr = 0.0f32;
-    let mut var_dark = 0.0f32;
-
-    for t in seeds.iter().chain(pool.iter()) {
-        for j in 0..16 {
-            let db = t.dsp.v_beat.get(j).copied().unwrap_or(0.0) - mean_b[j];
-            let dv = t.dsp.v_vocal.get(j).copied().unwrap_or(0.0) - mean_v[j];
-            let da = t.dsp.v_atmo.get(j).copied().unwrap_or(0.0) - mean_a[j];
-            std_b[j] += db * db;
-            std_v[j] += dv * dv;
-            std_a[j] += da * da;
-        }
-        let dag = t.dsp.aggression_index - mean_aggr;
-        let ddk = t.dsp.darkness_index - mean_dark;
-        var_aggr += dag * dag;
-        var_dark += ddk * ddk;
-    }
-    for j in 0..16 {
-        std_b[j] = (std_b[j] / n).sqrt().max(0.04);
-        std_v[j] = (std_v[j] / n).sqrt().max(0.04);
-        std_a[j] = (std_a[j] / n).sqrt().max(0.04);
-    }
-    let std_aggr = (var_aggr / n).sqrt().max(0.04);
-    let std_dark = (var_dark / n).sqrt().max(0.04);
-
-    for t in seeds.iter_mut().chain(pool.iter_mut()) {
-        for j in 0..16 {
-            if let Some(vb) = t.dsp.v_beat.get_mut(j) {
-                *vb = ((*vb - mean_b[j]) / std_b[j]).clamp(-2.6, 2.6);
-            }
-            if let Some(vv) = t.dsp.v_vocal.get_mut(j) {
-                *vv = ((*vv - mean_v[j]) / std_v[j]).clamp(-2.6, 2.6);
-            }
-            if let Some(va) = t.dsp.v_atmo.get_mut(j) {
-                *va = ((*va - mean_a[j]) / std_a[j]).clamp(-2.6, 2.6);
-            }
-        }
-        l2_normalize_in_place(&mut t.dsp.v_beat);
-        l2_normalize_in_place(&mut t.dsp.v_vocal);
-        l2_normalize_in_place(&mut t.dsp.v_atmo);
-
-        let z_aggr = (t.dsp.aggression_index - mean_aggr) / std_aggr;
-        let z_dark = (t.dsp.darkness_index - mean_dark) / std_dark;
-
-        // Combine physical baseline with pool-calibrated z-score for sharp discrimination
-        let cal_aggr = 0.25 * t.dsp.aggression_index + 0.75 * (0.50 + 0.45 * (0.85 * z_aggr).tanh());
-        let cal_dark = 0.25 * t.dsp.darkness_index + 0.75 * (0.50 + 0.45 * (0.85 * z_dark).tanh());
-
-        t.dsp.aggression_index = (cal_aggr.clamp(0.04, 0.96) * 100.0).round() / 100.0;
-        t.dsp.darkness_index = (cal_dark.clamp(0.04, 0.96) * 100.0).round() / 100.0;
     }
 }

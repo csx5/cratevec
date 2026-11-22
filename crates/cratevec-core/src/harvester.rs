@@ -11,6 +11,7 @@ use crate::dsp::{analyze_audio_bytes, cosine_similarity};
 use crate::models::{make_dedup_key, AnalyzedTrack, TrackMetadata};
 use crate::spotify::{is_spotify_url, resolve_spotify_input};
 use crate::storage::VectorStore;
+use crate::ytmusic;
 
 #[derive(Clone)]
 pub struct Harvester {
@@ -381,10 +382,17 @@ impl Harvester {
 
             let title_low = cand.title.to_lowercase();
             let artist_low = cand.artist.to_lowercase();
+            let seed_is_instrumental = seeds
+                .iter()
+                .any(|s| s.meta.title.to_lowercase().contains("instrumental"));
             if title_low.contains("karaoke")
                 || title_low.contains("ringtone")
                 || title_low.contains("8-bit")
                 || title_low.contains("lullaby")
+                || (!seed_is_instrumental
+                    && (title_low.contains("(instrumental")
+                        || title_low.contains("[instrumental")
+                        || title_low.ends_with(" instrumental")))
                 || artist_low.contains("karaoke")
                 || artist_low.contains("tribute")
                 || artist_low.contains("querbeat")
@@ -425,8 +433,15 @@ impl Harvester {
                 .filter(|c| c.is_alphanumeric())
                 .collect();
 
-            let max_for_artist = if artist_norm == seed_artist_norm { 1 } else { 2 };
-            let count = artist_counts.entry(artist_norm).or_insert(0);
+            let is_seed_artist = artist_norm == seed_artist_norm
+                || (seed_artist_norm.len() >= 4 && artist_norm.contains(&seed_artist_norm));
+            let artist_bucket = if is_seed_artist {
+                seed_artist_norm.clone()
+            } else {
+                artist_norm
+            };
+            let max_for_artist = if is_seed_artist { 1 } else { 2 };
+            let count = artist_counts.entry(artist_bucket).or_insert(0);
             if *count >= max_for_artist {
                 continue;
             }
@@ -503,17 +518,31 @@ impl Harvester {
         None
     }
 
-    /// Scene-Consensus Harvester (v0.4.0):
-    /// Completely eliminates hardcoded genre probes and unverified playlist noise.
-    /// Builds a multi-source Scene Artist Registry across:
-    /// 1. 1st-Hop Official Related Artists (`/artist/{id}/related`)
-    /// 2. Official Artist Radio (`/artist/{id}/radio`)
-    /// 3. Verified User Playlists (strictly requiring the playlist to contain the seed artist!)
-    /// 4. 2nd-Hop Related Artists expanded from the top highest-consensus scene artists.
+    /// Track-Level Song-Radio + Scene-Consensus Harvester (v0.6.0):
+    /// Primary source: YouTube Music track-level song radio (`RDAMVM<videoId>`), which finds
+    /// neighbors tailored to the EXACT song vibe (e.g. aggressive vs. chill tracks of the same artist)
+    /// rather than artist-average catalog popularity.
+    /// Secondary supplement / fallback: Deezer 1st-hop related artists & artist radio (and verified
+    /// playlists only when Track-Radio is sparse).
     async fn collect_metadata_around_seed(&self, seed: &AnalyzedTrack) -> Vec<TrackMetadata> {
         let mut rng = SessionRng::new(&format!("{}::{}", seed.meta.artist, seed.meta.title));
-        let mut scene_registry: HashMap<u64, SceneArtistStats> = HashMap::new();
 
+        // --- STEP 0 (PRIMARY): Track-Level Song-Radio (YouTube Music -> Deezer/iTunes Preview) ---
+        let mut ch_track_radio = self.fetch_track_radio_candidates(seed, &mut rng).await;
+        let track_radio_artists: HashSet<String> = ch_track_radio
+            .iter()
+            .map(|t| {
+                t.artist
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect()
+            })
+            .collect();
+
+        let track_radio_strong = ch_track_radio.len() >= 18;
+
+        let mut scene_registry: HashMap<u64, SceneArtistStats> = HashMap::new();
         let mut ch_related_deep_cuts: Vec<TrackMetadata> = Vec::new();
         let mut ch_artist_radio: Vec<TrackMetadata> = Vec::new();
         let mut ch_verified_playlists: Vec<TrackMetadata> = Vec::new();
@@ -525,7 +554,7 @@ impl Harvester {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // --- STEP 1: 1st-Hop Official Related Artists & Artist Radio ---
+        // --- STEP 1: 1st-Hop Official Related Artists & Artist Radio (Supplement / Fallback) ---
         let mut related_artists: Vec<DeezerArtist> = Vec::new();
         if let Some(dz_aid) = &dz_aid_opt {
             related_artists = self.fetch_deezer_related_artists(dz_aid).await;
@@ -540,12 +569,24 @@ impl Harvester {
 
             let mut radio = self
                 .fetch_deezer_track_list(
-                    &format!("https://api.deezer.com/artist/{}/radio?limit=30", dz_aid),
+                    &format!("https://api.deezer.com/artist/{}/radio?limit=24", dz_aid),
                     "Artist Radio Graph",
                 )
                 .await;
             for rt in &mut radio {
-                rt.scene_affinity = 0.88;
+                let a_norm: String = rt
+                    .artist
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect();
+                rt.scene_affinity = if track_radio_artists.contains(&a_norm) {
+                    0.96
+                } else if track_radio_strong {
+                    0.76
+                } else {
+                    0.86
+                };
                 if let Some(aid) = extract_dz_aid(&rt.artist_id) {
                     if aid != seed_aid_num {
                         let entry = scene_registry.entry(aid).or_insert_with(|| SceneArtistStats {
@@ -566,48 +607,50 @@ impl Harvester {
             ch_artist_radio.extend(radio);
         }
 
-        // --- STEP 2: Verified User Playlists (Strictly requiring seed artist presence!) ---
-        let raw_pl_batches = self
-            .fetch_verified_seed_playlists(&seed.meta.artist, &seed.meta.title, &mut rng)
-            .await;
-
-        let seed_artist_low = seed.meta.artist.to_lowercase();
+        // --- STEP 2: Verified User Playlists (Only when Track-Radio is sparse to avoid festival/party bleed) ---
         let mut playlist_candidate_buffer: Vec<(u64, usize, TrackMetadata)> = Vec::new();
+        if !track_radio_strong {
+            let raw_pl_batches = self
+                .fetch_verified_seed_playlists(&seed.meta.artist, &seed.meta.title, &mut rng)
+                .await;
 
-        for batch in raw_pl_batches {
-            let seed_pos = match batch
-                .iter()
-                .position(|t| t.artist.to_lowercase() == seed_artist_low)
-            {
-                Some(pos) => pos,
-                None => continue, // Hard Gate: Discard any playlist that doesn't actually contain the seed artist!
-            };
+            let seed_artist_low = seed.meta.artist.to_lowercase();
+            for batch in raw_pl_batches {
+                let seed_pos = match batch
+                    .iter()
+                    .position(|t| t.artist.to_lowercase() == seed_artist_low)
+                {
+                    Some(pos) => pos,
+                    None => continue,
+                };
 
-            let mut seen_artists_in_this_pl = HashSet::new();
-            for (idx, t) in batch.into_iter().enumerate() {
-                if t.artist.to_lowercase() == seed_artist_low || t.popularity_rank > 840_000 {
-                    continue;
-                }
-                let dist = idx.abs_diff(seed_pos);
-                if dist > 20 {
-                    continue;
-                }
-                if let Some(aid) = extract_dz_aid(&t.artist_id) {
-                    if seen_artists_in_this_pl.insert(aid) {
-                        let entry = scene_registry.entry(aid).or_insert_with(|| SceneArtistStats {
-                            artist_id: aid,
-                            ..Default::default()
-                        });
-                        entry.playlist_occurrences += 1;
-                        let pos_bonus = if dist <= 6 { 1.8 } else { 1.2 };
-                        entry.consensus_score += pos_bonus;
+                let mut seen_artists_in_this_pl = HashSet::new();
+                for (idx, t) in batch.into_iter().enumerate() {
+                    if t.artist.to_lowercase() == seed_artist_low || t.popularity_rank > 840_000 {
+                        continue;
                     }
-                    playlist_candidate_buffer.push((aid, dist, t));
+                    let dist = idx.abs_diff(seed_pos);
+                    if dist > 20 {
+                        continue;
+                    }
+                    if let Some(aid) = extract_dz_aid(&t.artist_id) {
+                        if seen_artists_in_this_pl.insert(aid) {
+                            let entry =
+                                scene_registry.entry(aid).or_insert_with(|| SceneArtistStats {
+                                    artist_id: aid,
+                                    ..Default::default()
+                                });
+                            entry.playlist_occurrences += 1;
+                            let pos_bonus = if dist <= 6 { 1.8 } else { 1.2 };
+                            entry.consensus_score += pos_bonus;
+                        }
+                        playlist_candidate_buffer.push((aid, dist, t));
+                    }
                 }
             }
         }
 
-        // --- STEP 3: Expand 2nd-Hop Related Artists from Top Scene Artists (Critical for Underground Artists) ---
+        // --- STEP 3: Expand 2nd-Hop Related Artists only when sparse ---
         let mut top_scene_aids: Vec<(f32, u64)> = scene_registry
             .values()
             .filter(|s| s.artist_id != seed_aid_num && s.consensus_score >= 2.4)
@@ -615,8 +658,7 @@ impl Harvester {
             .collect();
         top_scene_aids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // If 1st-hop related artists are sparse (< 6, e.g. PIXY or BashfortheWorld), query `/related` on the top 6 scene artists
-        if related_artists.len() < 6 {
+        if !track_radio_strong && related_artists.len() < 6 {
             let expand_aids: Vec<u64> = top_scene_aids.iter().take(6).map(|&(_, id)| id).collect();
             let rel2_futures = expand_aids.into_iter().map(|aid| {
                 let this = self.clone();
@@ -641,9 +683,7 @@ impl Harvester {
             }
         }
 
-        // --- STEP 4: Filter Verified Playlist Tracks by Multi-Source Scene Consensus ---
-        // A playlist track is admitted ONLY if its artist has true multi-source consensus
-        // (in 1st/2nd-hop artist graph, in artist radio, or appearing in >= 2 independent playlists).
+        // --- STEP 4: Filter Verified Playlist Tracks (fallback mode) ---
         playlist_candidate_buffer.sort_by_key(|&(_, dist, _)| dist);
         for (aid, _dist, mut t) in playlist_candidate_buffer {
             if let Some(stats) = scene_registry.get(&aid) {
@@ -652,19 +692,20 @@ impl Harvester {
                     || stats.in_artist_radio
                     || stats.playlist_occurrences >= 2;
                 if is_verified_scene {
-                    t.scene_affinity = (stats.consensus_score / 5.0).clamp(0.45, 0.98);
+                    t.scene_affinity = (stats.consensus_score / 5.0).clamp(0.45, 0.92);
                     ch_verified_playlists.push(t);
                 }
             }
         }
 
-        // --- STEP 5: Fetch Deep Cuts from 1st-Hop Related Artists ---
+        // --- STEP 5: Fetch Deep Cuts from 1st-Hop Related Artists (smaller slice when Track-Radio is strong) ---
         rng.shuffle(&mut related_artists);
-        let rel1_ids: Vec<u64> = related_artists.iter().take(14).map(|a| a.id).collect();
+        let rel1_limit = if track_radio_strong { 8 } else { 14 };
+        let rel1_ids: Vec<u64> = related_artists.iter().take(rel1_limit).map(|a| a.id).collect();
         let rel1_futures = rel1_ids.into_iter().map(|aid| {
             let this = self.clone();
             async move {
-                let url = format!("https://api.deezer.com/artist/{}/top?limit=12", aid);
+                let url = format!("https://api.deezer.com/artist/{}/top?limit=10", aid);
                 (aid, this.fetch_deezer_track_list(&url, "Related Artist Deep Cut").await)
             }
         });
@@ -673,81 +714,241 @@ impl Harvester {
 
         for (aid, mut batch) in rel1_batches {
             if batch.len() >= 4 {
-                batch.remove(0); // Skip #1 overplayed radio single to favor deep cuts
+                batch.remove(0);
             }
-            let aff = scene_registry
+            let base_aff = scene_registry
                 .get(&aid)
-                .map(|s| (s.consensus_score / 4.5).clamp(0.75, 1.0))
-                .unwrap_or(0.82);
+                .map(|s| (s.consensus_score / 4.5).clamp(0.72, 0.95))
+                .unwrap_or(0.78);
             for t in &mut batch {
-                t.scene_affinity = aff;
+                let a_norm: String = t
+                    .artist
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect();
+                t.scene_affinity = if track_radio_artists.contains(&a_norm) {
+                    (base_aff + 0.12).min(1.0)
+                } else if track_radio_strong {
+                    base_aff.min(0.78)
+                } else {
+                    base_aff
+                };
             }
             rng.shuffle(&mut batch);
             ch_related_deep_cuts.extend(batch.into_iter().take(2));
         }
 
-        // --- STEP 6: Fetch Deep Cuts from High-Consensus Co-Occurring & 2nd-Hop Scene Artists ---
-        let mut second_hop_candidates: Vec<(f32, u64)> = scene_registry
-            .values()
-            .filter(|s| {
-                s.artist_id != seed_aid_num && !s.in_first_hop_graph && s.consensus_score >= 2.2
-            })
-            .map(|s| (s.consensus_score, s.artist_id))
-            .collect();
-        second_hop_candidates
-            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // --- STEP 6: 2nd-Hop Deep Cuts (only when Track-Radio is sparse) ---
+        if !track_radio_strong {
+            let mut second_hop_candidates: Vec<(f32, u64)> = scene_registry
+                .values()
+                .filter(|s| {
+                    s.artist_id != seed_aid_num
+                        && !s.in_first_hop_graph
+                        && s.consensus_score >= 2.2
+                })
+                .map(|s| (s.consensus_score, s.artist_id))
+                .collect();
+            second_hop_candidates
+                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let sh_ids: Vec<(f32, u64)> = second_hop_candidates.into_iter().take(12).collect();
-        let sh_futures = sh_ids.into_iter().map(|(c_score, aid)| {
-            let this = self.clone();
-            async move {
-                let url = format!("https://api.deezer.com/artist/{}/top?limit=10", aid);
-                let list = this
-                    .fetch_deezer_track_list(&url, "Scene Consensus Graph")
-                    .await;
-                (c_score, list)
-            }
-        });
-        let sh_batches: Vec<(f32, Vec<TrackMetadata>)> =
-            stream::iter(sh_futures).buffer_unordered(8).collect().await;
+            let sh_ids: Vec<(f32, u64)> = second_hop_candidates.into_iter().take(12).collect();
+            let sh_futures = sh_ids.into_iter().map(|(c_score, aid)| {
+                let this = self.clone();
+                async move {
+                    let url = format!("https://api.deezer.com/artist/{}/top?limit=10", aid);
+                    let list = this
+                        .fetch_deezer_track_list(&url, "Scene Consensus Graph")
+                        .await;
+                    (c_score, list)
+                }
+            });
+            let sh_batches: Vec<(f32, Vec<TrackMetadata>)> =
+                stream::iter(sh_futures).buffer_unordered(8).collect().await;
 
-        for (c_score, mut batch) in sh_batches {
-            if batch.len() >= 4 {
-                batch.remove(0);
+            for (c_score, mut batch) in sh_batches {
+                if batch.len() >= 4 {
+                    batch.remove(0);
+                }
+                batch.retain(|t| t.popularity_rank < 840_000);
+                let aff = (c_score / 4.5).clamp(0.55, 0.92);
+                for t in &mut batch {
+                    t.scene_affinity = aff;
+                }
+                rng.shuffle(&mut batch);
+                ch_second_hop.extend(batch.into_iter().take(2));
             }
-            batch.retain(|t| t.popularity_rank < 840_000);
-            let aff = (c_score / 4.5).clamp(0.55, 0.95);
-            for t in &mut batch {
-                t.scene_affinity = aff;
-            }
-            rng.shuffle(&mut batch);
-            ch_second_hop.extend(batch.into_iter().take(2));
         }
 
-        // --- Round-Robin Interleaving across the 4 Verified Scene Channels ---
-        let mut interleaved = Vec::with_capacity(85);
-        let max_len = ch_related_deep_cuts
-            .len()
-            .max(ch_artist_radio.len())
-            .max(ch_second_hop.len())
-            .max(ch_verified_playlists.len());
+        // --- Boost Track-Radio items whose artist is also verified in Deezer's scene graph ---
+        for t in &mut ch_track_radio {
+            if let Some(aid) = extract_dz_aid(&t.artist_id) {
+                if scene_registry.contains_key(&aid) {
+                    t.scene_affinity = (t.scene_affinity + 0.05).min(1.0);
+                }
+            }
+        }
 
-        for i in 0..max_len {
-            if let Some(t) = ch_related_deep_cuts.get(i) {
-                interleaved.push(t.clone());
+        // --- Weighted Interleaving: Track-Level Radio dominates (~75%), Deezer supplements ---
+        let mut interleaved = Vec::with_capacity(96);
+        let mut idx_tr = 0usize;
+        let mut idx_rel = 0usize;
+        let mut idx_ar = 0usize;
+        let mut idx_sh = 0usize;
+        let mut idx_pl = 0usize;
+
+        for round in 0..40 {
+            let tr_take = if track_radio_strong { 3 } else { 2 };
+            for _ in 0..tr_take {
+                if let Some(t) = ch_track_radio.get(idx_tr) {
+                    interleaved.push(t.clone());
+                    idx_tr += 1;
+                }
             }
-            if let Some(t) = ch_artist_radio.get(i) {
+            if round % 2 == 0 {
+                if let Some(t) = ch_related_deep_cuts.get(idx_rel) {
+                    interleaved.push(t.clone());
+                    idx_rel += 1;
+                }
+            } else if let Some(t) = ch_artist_radio.get(idx_ar) {
                 interleaved.push(t.clone());
+                idx_ar += 1;
             }
-            if let Some(t) = ch_second_hop.get(i) {
-                interleaved.push(t.clone());
+            if !track_radio_strong {
+                if let Some(t) = ch_second_hop.get(idx_sh) {
+                    interleaved.push(t.clone());
+                    idx_sh += 1;
+                }
+                if let Some(t) = ch_verified_playlists.get(idx_pl) {
+                    interleaved.push(t.clone());
+                    idx_pl += 1;
+                }
             }
-            if let Some(t) = ch_verified_playlists.get(i) {
-                interleaved.push(t.clone());
+            if idx_tr >= ch_track_radio.len()
+                && idx_rel >= ch_related_deep_cuts.len()
+                && idx_ar >= ch_artist_radio.len()
+                && idx_sh >= ch_second_hop.len()
+                && idx_pl >= ch_verified_playlists.len()
+            {
+                break;
             }
         }
 
         interleaved
+    }
+
+    /// Resolves track-level song radio pairs from YouTube Music into playable Deezer/iTunes previews.
+    async fn fetch_track_radio_candidates(
+        &self,
+        seed: &AnalyzedTrack,
+        rng: &mut SessionRng,
+    ) -> Vec<TrackMetadata> {
+        let radio_pairs =
+            ytmusic::fetch_song_radio(&self.client, &seed.meta.artist, &seed.meta.title).await;
+        if radio_pairs.is_empty() {
+            return Vec::new();
+        }
+
+        // Preserve top-tier ordering while adding light within-tier freshness across sessions
+        let mut indexed: Vec<(usize, String, String)> = radio_pairs
+            .into_iter()
+            .take(44)
+            .enumerate()
+            .map(|(i, (a, t))| (i, a, t))
+            .collect();
+        if indexed.len() > 14 {
+            rng.shuffle(&mut indexed[..14]);
+            rng.shuffle(&mut indexed[14..]);
+        } else {
+            rng.shuffle(&mut indexed);
+        }
+
+        let futures = indexed.into_iter().map(|(orig_rank, artist, title)| {
+            let this = self.clone();
+            async move {
+                let mut meta = this.resolve_pair_to_preview(&artist, &title).await?;
+                meta.discovery_channel = "Track-Radio".to_string();
+                meta.scene_affinity = if orig_rank < 12 {
+                    0.97
+                } else if orig_rank < 26 {
+                    0.93
+                } else {
+                    0.88
+                };
+                Some(meta)
+            }
+        });
+
+        stream::iter(futures)
+            .buffer_unordered(12)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await
+    }
+
+    async fn resolve_pair_to_preview(&self, artist: &str, title: &str) -> Option<TrackMetadata> {
+        let base_title = title
+            .split('(')
+            .next()
+            .unwrap_or(title)
+            .split('[')
+            .next()
+            .unwrap_or(title)
+            .trim();
+
+        let structured = format!("artist:\"{}\" track:\"{}\"", artist, base_title);
+        let mut hits = self
+            .search_deezer_tracks_limit(&structured, "Track-Radio", 4)
+            .await;
+
+        if hits.is_empty() {
+            let plain = format!("{} {}", artist, base_title);
+            hits = self
+                .search_deezer_tracks_limit(&plain, "Track-Radio", 5)
+                .await;
+        }
+
+        if hits.is_empty() {
+            let plain = format!("{} {}", artist, base_title);
+            hits = self.search_itunes_tracks(&plain, "Track-Radio").await;
+        }
+
+        if hits.is_empty() {
+            return None;
+        }
+
+        let query_lower = format!("{} {}", artist, base_title).to_lowercase();
+        let tokens: Vec<&str> = query_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        hits.sort_by(|a, b| {
+            let sa = seed_match_score(a, &tokens, Some(artist), Some(base_title));
+            let sb = seed_match_score(b, &tokens, Some(artist), Some(base_title));
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let best = hits.into_iter().find(|t| !t.preview_url.is_empty())?;
+        // Basic sanity check: ensure at least artist or title shares a meaningful token
+        let best_a = best.artist.to_lowercase();
+        let best_t = best.title.to_lowercase();
+        let target_a = artist.to_lowercase();
+        let target_t = base_title.to_lowercase();
+        let artist_ok = target_a
+            .split_whitespace()
+            .filter(|w| w.len() >= 2)
+            .any(|w| best_a.contains(w) || best_t.contains(w));
+        let title_ok = target_t
+            .split_whitespace()
+            .filter(|w| w.len() >= 2)
+            .any(|w| best_t.contains(w));
+        if artist_ok || title_ok {
+            Some(best)
+        } else {
+            None
+        }
     }
 
     async fn fetch_deezer_related_artists(&self, dz_artist_id: &str) -> Vec<DeezerArtist> {

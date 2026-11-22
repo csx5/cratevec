@@ -5,6 +5,7 @@ pub mod session;
 pub mod spotify;
 pub mod storage;
 pub mod trainer;
+pub mod ytmusic;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -132,7 +133,7 @@ impl CrateVecEngine {
         track_id: &str,
         direction: SwipeDirection,
     ) -> Result<SessionSnapshot> {
-        let super_seed = {
+        let (super_seed, auto_replenish_seed) = {
             let mut guard = self
                 .active_session
                 .write()
@@ -144,10 +145,24 @@ impl CrateVecEngine {
             if let Ok(mut mm) = self.metric_model.write() {
                 *mm = session.metric_model.clone();
             }
-            res
+
+            let auto_seed = if res.is_none()
+                && (session.remaining_unseen_count() < 12 || session.likes_since_replenish >= 4)
+            {
+                session.likes_since_replenish = 0;
+                session.latest_liked_or_seed()
+            } else {
+                None
+            };
+
+            (res, auto_seed)
         };
 
-        if let Some(seed_track) = super_seed {
+        let harvest_target = super_seed
+            .map(|t| (t, 26usize))
+            .or_else(|| auto_replenish_seed.map(|t| (t, 20usize)));
+
+        if let Some((seed_track, count)) = harvest_target {
             let prev_seen: HashSet<String> = self
                 .global_seen_dedups
                 .read()
@@ -155,7 +170,7 @@ impl CrateVecEngine {
                 .unwrap_or_default();
             let extra = self
                 .harvester
-                .harvest_pool_for_seeds(std::slice::from_ref(&seed_track), 24, &prev_seen)
+                .harvest_pool_for_seeds(std::slice::from_ref(&seed_track), count, &prev_seen)
                 .await;
             if let Ok(mut guard) = self.active_session.write() {
                 if let Some(session) = guard.as_mut() {
@@ -175,6 +190,84 @@ impl CrateVecEngine {
         }
 
         Ok(snap)
+    }
+
+    pub fn undo_last_swipe(&self) -> Result<SessionSnapshot> {
+        let mut guard = self
+            .active_session
+            .write()
+            .map_err(|_| anyhow!("Session lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+        if !session.undo_last_swipe() {
+            return Err(anyhow!("Kein vorheriger Swipe zum Rueckgaengigmachen"));
+        }
+        if let Ok(mut mm) = self.metric_model.write() {
+            *mm = session.metric_model.clone();
+        }
+        Ok(session.snapshot())
+    }
+
+    pub fn remove_negative_anchor(&self, track_id: &str) -> Result<SessionSnapshot> {
+        let mut guard = self
+            .active_session
+            .write()
+            .map_err(|_| anyhow!("Session lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+        session.remove_negative_anchor(track_id);
+        Ok(session.snapshot())
+    }
+
+    pub fn remove_crate_track(&self, track_id: &str) -> Result<SessionSnapshot> {
+        let mut guard = self
+            .active_session
+            .write()
+            .map_err(|_| anyhow!("Session lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+        session.remove_crate_track(track_id);
+        Ok(session.snapshot())
+    }
+
+    pub async fn load_more_candidates(&self) -> Result<SessionSnapshot> {
+        let seed_track = {
+            let guard = self
+                .active_session
+                .read()
+                .map_err(|_| anyhow!("Session lock poisoned"))?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+            session
+                .latest_liked_or_seed()
+                .ok_or_else(|| anyhow!("Kein Seed zum Nachladen vorhanden"))?
+        };
+
+        let prev_seen: HashSet<String> = self
+            .global_seen_dedups
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        let extra = self
+            .harvester
+            .harvest_pool_for_seeds(std::slice::from_ref(&seed_track), 28, &prev_seen)
+            .await;
+
+        let mut guard = self
+            .active_session
+            .write()
+            .map_err(|_| anyhow!("Session lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+        session.likes_since_replenish = 0;
+        session.extend_pool(extra);
+        Ok(session.snapshot())
     }
 
     pub fn focus_track(&self, track_id: &str) -> Result<SessionSnapshot> {

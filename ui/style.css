@@ -756,12 +756,113 @@ input[type="range"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .player-controls {
   display: flex;
   gap: 6px;
+  align-items: center;
+}
+
+.player-right-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+#slider-volume {
+  width: 68px;
+  accent-color: var(--accent-amber);
+  cursor: pointer;
+}
+
+.preview-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  background: #231e15;
+  border: 1px solid var(--accent-amber);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent-amber);
+}
+
+.suggest-item.active {
+  background: #232732;
+  outline: 1px solid var(--accent-amber);
+}
+
+.remove-x-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.remove-x-btn:hover {
+  border-color: var(--accent-red);
+  color: var(--accent-red);
+}
+
+.track-card.flash-right {
+  border-color: var(--accent-green);
+}
+
+.track-card.flash-left {
+  border-color: var(--text-muted);
+}
+
+.track-card.flash-up {
+  border-color: var(--accent-blue);
+}
+
+.track-card.flash-down {
+  border-color: var(--accent-red);
+}
+
+.toast-container {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 360px;
+  pointer-events: none;
+}
+
+.toast-item {
+  padding: 8px 12px;
+  background: #171a21;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-amber);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+.toast-item.toast-error {
+  border-left-color: var(--accent-red);
+}
+
+.toast-item.toast-ok {
+  border-left-color: var(--accent-green);
 }
 
 .drop-sniper-toggle {
