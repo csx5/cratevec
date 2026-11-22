@@ -35,7 +35,7 @@
         <input
           id="bridge-input"
           type="text"
-          placeholder="Zweiten Song kreuzen (z.B. 2hollis, Crystal Castles)..."
+          placeholder="Zweiten Song kreuzen..."
         >
         <div id="bridge-suggest" class="suggest-dropdown hidden"></div>
       </div>
@@ -112,8 +112,10 @@
     <!-- CENTER PANE: SWIPE DECK & 2D SONIC MAP -->
     <section class="pane pane-center">
       <div class="view-tabs">
-        <button type="button" class="tab-btn active" data-view="deck">01 // SWIPE DECK</button>
-        <button type="button" class="tab-btn" data-view="map">02 // 2D SONIC MAP</button>
+        <button type="button" class="tab-btn active" data-view="deck">01 // DECK</button>
+        <button type="button" class="tab-btn" data-view="map">02 // MAP</button>
+        <button type="button" class="tab-btn" data-view="history">03 // VERLAUF <span id="tab-history-count" class="tab-count">0</span></button>
+        <button type="button" class="tab-btn tab-saved" data-view="saved">04 // GEMERKT <span id="tab-saved-count" class="tab-count">0</span></button>
         <div class="pool-telemetry">
           <span>POOL: <strong id="stat-pool">0</strong></span>
           <span>GEPRUEFT: <strong id="stat-seen">0</strong></span>
@@ -154,8 +156,11 @@
               <div class="card-score-row">
                 <span id="card-total-score" class="score-pill">--% MATCH</span>
                 <span id="card-channel" class="channel-tag">--</span>
-                <a id="card-spotify-link" href="#" target="_blank" rel="noopener" class="ext-link">SPOTIFY OPEN</a>
-                <a id="card-source-link" href="#" target="_blank" rel="noopener" class="ext-link">QUELLE</a>
+                <div class="card-top-actions">
+                  <button type="button" id="btn-save-card" class="btn btn-small btn-bookmark" title="Song separat dauerhaft merken (Taste B)">MERKEN [B]</button>
+                  <a id="card-spotify-link" href="#" target="_blank" rel="noopener" class="ext-link">SPOTIFY</a>
+                  <a id="card-source-link" href="#" target="_blank" rel="noopener" class="ext-link">QUELLE</a>
+                </div>
               </div>
               <h2 id="card-title" class="card-title">--</h2>
               <div id="card-artist" class="card-artist">--</div>
@@ -192,24 +197,26 @@
               <button type="button" id="btn-exit-preview" class="btn btn-small">ZURUECK ZUR KARTE</button>
             </div>
             <div class="player-header">
-              <div class="player-controls">
-                <button type="button" id="btn-play-toggle" class="btn btn-small">PLAY [SPACE]</button>
-                <button type="button" id="btn-jump-drop" class="btn btn-small">DROP [<span id="drop-time-label">0.0s</span>]</button>
-                <button type="button" id="btn-undo" class="btn btn-small" disabled title="Letzten Swipe rueckgaengig machen (Z / Backspace)">UNDO [Z]</button>
+              <div class="player-row-top">
+                <div class="player-controls">
+                  <button type="button" id="btn-play-toggle" class="btn btn-small">PLAY [SPACE]</button>
+                  <button type="button" id="btn-jump-drop" class="btn btn-small">DROP [<span id="drop-time-label">0.0s</span>]</button>
+                  <button type="button" id="btn-undo" class="btn btn-small" disabled title="Letzten Swipe rueckgaengig machen (Z / Backspace)">UNDO [Z]</button>
+                </div>
+                <span id="player-time" class="mono-time">00.0s / 30.0s</span>
               </div>
-              <div class="player-right-controls">
+              <div class="player-row-bottom">
                 <div class="volume-control" title="Lautstaerke (Taste M fuer Mute)">
                   <button type="button" id="btn-mute" class="btn btn-small">VOL</button>
                   <input id="slider-volume" type="range" min="0" max="100" value="85">
                 </div>
                 <label class="drop-sniper-toggle">
                   <input type="checkbox" id="chk-auto-drop" checked>
-                  <span>AUTO-DROP</span>
+                  <span>DROP-SNIPER AUTO-SEEK</span>
                 </label>
-                <span id="player-time" class="mono-time">00.0s / 30.0s</span>
               </div>
             </div>
-            <canvas id="waveform-canvas" width="620" height="76"></canvas>
+            <canvas id="waveform-canvas" width="720" height="92"></canvas>
             <audio id="audio-player" preload="auto"></audio>
           </div>
 
@@ -238,16 +245,58 @@
       <!-- VIEW 2: 2D SONIC MAP -->
       <div id="view-map" class="center-view hidden">
         <div class="map-container">
-          <canvas id="sonic-map-canvas" width="640" height="460"></canvas>
+          <canvas id="sonic-map-canvas" width="680" height="480"></canvas>
           <div id="map-inspector" class="map-inspector">
             <div class="inspector-info">
               <strong id="insp-title">Punkt auf der Karte anklicken</strong>
               <span id="insp-sub">Klick spielt den Song direkt am Beat-Drop an.</span>
             </div>
             <div class="inspector-actions">
+              <button type="button" id="btn-insp-save" class="btn btn-small" disabled>MERKEN</button>
               <button type="button" id="btn-insp-like" class="btn btn-small" disabled>IN CRATE</button>
               <button type="button" id="btn-insp-kill" class="btn btn-small" disabled>KILL VIBE</button>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 3: VERLAUF (HISTORY) -->
+      <div id="view-history" class="center-view hidden">
+        <div class="library-panel">
+          <div class="library-toolbar">
+            <div class="filter-pills" id="history-filters">
+              <button type="button" class="btn btn-small active" data-filter="all">ALLE</button>
+              <button type="button" class="btn btn-small" data-filter="right">IN CRATE</button>
+              <button type="button" class="btn btn-small" data-filter="up">SUPER-SEED</button>
+              <button type="button" class="btn btn-small" data-filter="left">SKIP</button>
+              <button type="button" class="btn btn-small" data-filter="down">KILL</button>
+              <button type="button" class="btn btn-small" data-filter="seed">SEEDS</button>
+            </div>
+            <input id="history-search" type="text" class="library-search" placeholder="Verlauf durchsuchen...">
+            <button type="button" id="btn-clear-history" class="btn btn-small">VERLAUF LEEREN</button>
+          </div>
+          <div id="history-list" class="library-list">
+            <div class="empty-hint">Noch keine Eintraege im Verlauf.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 4: GEMERKT (SEPARATER PERSISTENTER MERKZETTEL) -->
+      <div id="view-saved" class="center-view hidden">
+        <div class="library-panel">
+          <div class="library-toolbar">
+            <input id="saved-search" type="text" class="library-search" placeholder="Gemerkte Songs durchsuchen...">
+            <div class="saved-export-group">
+              <button type="button" id="btn-saved-export-spotify" class="btn btn-small">SPOTIFY LINKS</button>
+              <button type="button" id="btn-saved-export-m3u" class="btn btn-small">.M3U</button>
+              <button type="button" id="btn-saved-export-json" class="btn btn-small">JSON</button>
+            </div>
+          </div>
+          <div class="saved-hint-bar">
+            Dauerhafter Merk-Bereich (bleibt ueber alle Sessions und Neustarts hinweg gespeichert). Taste <code>B</code> merkt den aktuellen Song.
+          </div>
+          <div id="saved-list" class="library-list">
+            <div class="empty-hint">Noch keine Songs gemerkt. Druecke [B] oder klicke auf MERKEN bei einem Song.</div>
           </div>
         </div>
       </div>

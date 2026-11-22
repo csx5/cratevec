@@ -164,6 +164,27 @@ pub struct SonicMapPoint {
     pub kind: String, // "seed" | "candidate" | "liked" | "negative"
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub track: AnalyzedTrack,
+    /// "seed" | "right" | "left" | "up" | "down"
+    pub action: String,
+    pub seed_context: String,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTrackEntry {
+    pub track: AnalyzedTrack,
+    pub saved_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LibrarySnapshot {
+    pub history: Vec<HistoryEntry>,
+    pub saved: Vec<SavedTrackEntry>,
+}
+
 pub fn make_dedup_key(artist: &str, title: &str) -> String {
     let clean_artist: String = artist
         .to_lowercase()

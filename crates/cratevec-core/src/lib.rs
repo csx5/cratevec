@@ -15,14 +15,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 
 use crate::harvester::Harvester;
-use crate::models::{MixerWeights, SessionSnapshot, SwipeDirection, TrackMetadata};
+use crate::models::{
+    AnalyzedTrack, LibrarySnapshot, MixerWeights, SessionSnapshot, SwipeDirection, TrackMetadata,
+};
 use crate::session::DiscoverySession;
-use crate::storage::VectorStore;
+use crate::storage::{LibraryStore, VectorStore};
 use crate::trainer::{TrainedMetricModel, TrainingReport};
 
 #[derive(Clone)]
 pub struct CrateVecEngine {
     harvester: Harvester,
+    library: LibraryStore,
     active_session: Arc<RwLock<Option<DiscoverySession>>>,
     global_seen_dedups: Arc<RwLock<HashSet<String>>>,
     metric_model: Arc<RwLock<TrainedMetricModel>>,
@@ -31,10 +34,12 @@ pub struct CrateVecEngine {
 impl CrateVecEngine {
     pub fn new(cache_path: Option<PathBuf>) -> Self {
         let store = VectorStore::new(cache_path);
+        let library = LibraryStore::new(None);
         let harvester = Harvester::new(store);
         let model = TrainedMetricModel::load_or_default(None);
         Self {
             harvester,
+            library,
             active_session: Arc::new(RwLock::new(None)),
             global_seen_dedups: Arc::new(RwLock::new(HashSet::new())),
             metric_model: Arc::new(RwLock::new(model)),
@@ -78,6 +83,11 @@ impl CrateVecEngine {
         let session = DiscoverySession::new(session_id, seeds.clone(), pool, prev_seen, model);
         let snapshot = session.snapshot();
 
+        for s in &seeds {
+            self.library
+                .record_history(s.clone(), "seed", &format!("{} - {}", s.meta.artist, s.meta.title));
+        }
+
         if let Ok(mut g) = self.global_seen_dedups.write() {
             for s in &seeds {
                 g.insert(s.meta.dedup_key.clone());
@@ -118,6 +128,12 @@ impl CrateVecEngine {
         session.add_bridge_seed(seed.clone(), new_candidates);
         let snapshot = session.snapshot();
 
+        self.library.record_history(
+            seed.clone(),
+            "seed",
+            &format!("Bridge: {} - {}", seed.meta.artist, seed.meta.title),
+        );
+
         if let Ok(mut g) = self.global_seen_dedups.write() {
             g.insert(seed.meta.dedup_key);
             if let Some(card) = &snapshot.current_card {
@@ -133,7 +149,7 @@ impl CrateVecEngine {
         track_id: &str,
         direction: SwipeDirection,
     ) -> Result<SessionSnapshot> {
-        let (super_seed, auto_replenish_seed) = {
+        let (super_seed, auto_replenish_seed, swiped_track, seed_ctx) = {
             let mut guard = self
                 .active_session
                 .write()
@@ -141,6 +157,12 @@ impl CrateVecEngine {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| anyhow!("Keine aktive Session vorhanden"))?;
+            let swiped = session.pool.iter().find(|t| t.meta.id == track_id).cloned();
+            let ctx = session
+                .seeds
+                .first()
+                .map(|s| format!("{} - {}", s.meta.artist, s.meta.title))
+                .unwrap_or_default();
             let res = session.apply_swipe(track_id, direction);
             if let Ok(mut mm) = self.metric_model.write() {
                 *mm = session.metric_model.clone();
@@ -155,8 +177,18 @@ impl CrateVecEngine {
                 None
             };
 
-            (res, auto_seed)
+            (res, auto_seed, swiped, ctx)
         };
+
+        if let Some(track) = swiped_track {
+            let action = match direction {
+                SwipeDirection::Right => "right",
+                SwipeDirection::Left => "left",
+                SwipeDirection::Up => "up",
+                SwipeDirection::Down => "down",
+            };
+            self.library.record_history(track, action, &seed_ctx);
+        }
 
         let harvest_target = super_seed
             .map(|t| (t, 26usize))
@@ -327,6 +359,55 @@ impl CrateVecEngine {
             .read()
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.snapshot()))
+    }
+
+    pub fn get_library(&self) -> LibrarySnapshot {
+        self.library.snapshot()
+    }
+
+    pub fn clear_history(&self) -> LibrarySnapshot {
+        self.library.clear_history();
+        self.library.snapshot()
+    }
+
+    pub fn toggle_save_track(&self, track_id: &str) -> Result<(bool, LibrarySnapshot)> {
+        let track = self
+            .find_any_track(track_id)
+            .ok_or_else(|| anyhow!("Track nicht gefunden: {}", track_id))?;
+        let is_saved = self.library.toggle_saved(track);
+        Ok((is_saved, self.library.snapshot()))
+    }
+
+    pub fn remove_saved_track(&self, track_id: &str) -> LibrarySnapshot {
+        self.library.remove_saved(track_id);
+        self.library.snapshot()
+    }
+
+    fn find_any_track(&self, track_id: &str) -> Option<AnalyzedTrack> {
+        if let Ok(guard) = self.active_session.read() {
+            if let Some(session) = guard.as_ref() {
+                if let Some(t) = session.pool.iter().find(|t| t.meta.id == track_id) {
+                    return Some(t.clone());
+                }
+                if let Some(t) = session.seeds.iter().find(|t| t.meta.id == track_id) {
+                    return Some(t.clone());
+                }
+                if let Some(t) = session.liked_crate.iter().find(|t| t.meta.id == track_id) {
+                    return Some(t.clone());
+                }
+                if let Some(t) = session
+                    .negative_anchors
+                    .iter()
+                    .find(|t| t.meta.id == track_id)
+                {
+                    return Some(t.clone());
+                }
+            }
+        }
+        if let Some(t) = self.library.find_track(track_id) {
+            return Some(t);
+        }
+        self.harvester.store().get_by_id(track_id)
     }
 
     /// Runs Contrastive Triplet Margin Training over all cached vectors (optionally harvesting additional

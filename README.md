@@ -75,6 +75,7 @@ docker compose up --build -d
 | `Leertaste` | Play / Pause |
 | `R` | Direkt zum erkannten Beat-Drop springen |
 | `Z` / `Backspace` | Letzten Swipe rueckgaengig machen (Undo) |
+| `B` | Aktuellen Song separat dauerhaft merken (Tab `04 // GEMERKT`) |
 | `1` - `4` | Zwischen den 4 Vibe-Korridoren wechseln |
 | `/` / `Strg+K` | Direkt in die Seed-Suche springen |
 | `M` | Audio stummschalten (Mute) |

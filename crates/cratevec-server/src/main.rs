@@ -114,6 +114,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/session/corridor", post(api_select_corridor))
         .route("/api/session/weights", post(api_update_weights))
         .route("/api/session/snapshot", get(api_get_snapshot))
+        .route("/api/library", get(api_get_library))
+        .route("/api/history/clear", post(api_clear_history))
+        .route("/api/saved/toggle", post(api_toggle_saved))
+        .route("/api/saved/remove", post(api_remove_saved))
         .route("/api/audio/proxy", get(api_audio_proxy))
         .fallback_service(ServeDir::new(ui_dir))
         .layer(CorsLayer::permissive())
@@ -356,6 +360,43 @@ async fn api_get_snapshot(State(state): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct ToggleSavedResp {
+    saved: bool,
+    library: cratevec_core::models::LibrarySnapshot,
+}
+
+async fn api_get_library(State(state): State<AppState>) -> Response {
+    Json(state.engine.get_library()).into_response()
+}
+
+async fn api_clear_history(State(state): State<AppState>) -> Response {
+    Json(state.engine.clear_history()).into_response()
+}
+
+async fn api_toggle_saved(
+    State(state): State<AppState>,
+    Json(req): Json<FocusRequest>,
+) -> Response {
+    match state.engine.toggle_save_track(&req.track_id) {
+        Ok((saved, library)) => Json(ToggleSavedResp { saved, library }).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResp {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_remove_saved(
+    State(state): State<AppState>,
+    Json(req): Json<FocusRequest>,
+) -> Response {
+    Json(state.engine.remove_saved_track(&req.track_id)).into_response()
 }
 
 async fn api_audio_proxy(

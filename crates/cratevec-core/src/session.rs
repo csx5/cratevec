@@ -835,23 +835,19 @@ impl DiscoverySession {
             _ => "Korridor: Sample & Atmo",
         };
 
-        let mut explanation = Vec::with_capacity(6);
+        let mut explanation = Vec::with_capacity(5);
         explanation.push(corridor_label.to_string());
         explanation.push(format!(
-            "Haerte/Aggr: {:.0}% | Duesterkeit: {:.0}%",
+            "Haerte: {:.0}% | Dark: {:.0}%",
             track.dsp.aggression_index * 100.0,
             track.dsp.darkness_index * 100.0
         ));
         explanation.push(format!(
-            "{:.1} BPM (Drop @ {:.1}s)",
+            "{:.1} BPM | Drop @ {:.1}s",
             track.dsp.bpm, track.dsp.drop_start_sec
         ));
         explanation.push(format!(
-            "Beat: {:.0}% | Vocals: {:.0}% | Atmo: {:.0}%",
-            beat_pct, vocal_pct, atmo_pct
-        ));
-        explanation.push(format!(
-            "Szene-Konsens: {:.0}% ({})",
+            "Szene: {:.0}% ({})",
             track.meta.scene_affinity * 100.0,
             track.meta.discovery_channel
         ));

@@ -53,6 +53,13 @@
     isSwiping: false,
     previewTrack: null,
     lastVolume: 0.85,
+    library: { history: [], saved: [] },
+    savedIds: new Set(),
+    savedDedups: new Set(),
+    historyFilter: "all",
+    historyQuery: "",
+    savedQuery: "",
+    playingLibraryId: null,
   };
 
   // --- DOM References ---
@@ -75,11 +82,262 @@
   const chkAutoDrop = document.getElementById("chk-auto-drop");
   const btnUndo = document.getElementById("btn-undo");
   const btnLoadMore = document.getElementById("btn-load-more");
+  const btnSaveCard = document.getElementById("btn-save-card");
   const sliderVolume = document.getElementById("slider-volume");
   const btnMute = document.getElementById("btn-mute");
   const previewBanner = document.getElementById("preview-banner");
   const previewBannerText = document.getElementById("preview-banner-text");
   const toastContainer = document.getElementById("toast-container");
+  const tabHistoryCount = document.getElementById("tab-history-count");
+  const tabSavedCount = document.getElementById("tab-saved-count");
+
+  function isTrackSaved(meta) {
+    if (!meta) return false;
+    return state.savedIds.has(meta.id) || (meta.dedup_key && state.savedDedups.has(meta.dedup_key));
+  }
+
+  function applyLibrary(lib) {
+    state.library = lib || { history: [], saved: [] };
+    state.savedIds = new Set((state.library.saved || []).map((e) => e.track.meta.id));
+    state.savedDedups = new Set((state.library.saved || []).map((e) => e.track.meta.dedup_key));
+
+    const hLen = (state.library.history || []).length;
+    const sLen = (state.library.saved || []).length;
+    if (tabHistoryCount) tabHistoryCount.textContent = String(hLen);
+    if (tabSavedCount) tabSavedCount.textContent = String(sLen);
+    const savedTabBtn = document.querySelector('.tab-btn[data-view="saved"]');
+    if (savedTabBtn) savedTabBtn.classList.toggle("has-items", sLen > 0);
+
+    updateSaveCardButton();
+    if (state.snapshot) {
+      renderCrate(state.snapshot.liked_crate);
+      renderQueue(state.snapshot.queue_preview);
+    }
+    renderHistory();
+    renderSaved();
+  }
+
+  async function refreshLibrary() {
+    try {
+      const lib = await apiFetch("/api/library");
+      applyLibrary(lib);
+    } catch (_) {}
+  }
+
+  function updateSaveCardButton() {
+    if (!btnSaveCard) return;
+    const card = state.snapshot && state.snapshot.current_card;
+    const saved = card && isTrackSaved(card.track.meta);
+    btnSaveCard.classList.toggle("saved", !!saved);
+    btnSaveCard.textContent = saved ? "GEMERKT [B]" : "MERKEN [B]";
+  }
+
+  async function toggleSaveTrack(trackId) {
+    if (!trackId) return;
+    try {
+      const res = await apiFetch("/api/saved/toggle", {
+        method: "POST",
+        body: JSON.stringify({ track_id: trackId }),
+      });
+      applyLibrary(res.library);
+      showToast(
+        res.saved ? "Song gemerkt (Tab 04 // GEMERKT)." : "Aus Gemerkt entfernt.",
+        res.saved ? "ok" : "info"
+      );
+    } catch (err) {
+      showToast(`Merken fehlgeschlagen: ${err.message}`, "error");
+    }
+  }
+
+  async function removeSavedTrack(trackId) {
+    if (!trackId) return;
+    try {
+      const lib = await apiFetch("/api/saved/remove", {
+        method: "POST",
+        body: JSON.stringify({ track_id: trackId }),
+      });
+      applyLibrary(lib);
+      showToast("Aus Gemerkt entfernt.", "info");
+    } catch (err) {
+      showToast(`Fehler: ${err.message}`, "error");
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      const lib = await apiFetch("/api/history/clear", { method: "POST" });
+      applyLibrary(lib);
+      showToast("Verlauf geleert.", "info");
+    } catch (err) {
+      showToast(`Fehler: ${err.message}`, "error");
+    }
+  }
+
+  function switchView(view) {
+    state.activeView = view;
+    document.querySelectorAll(".tab-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-view") === view);
+    });
+    ["deck", "map", "history", "saved"].forEach((v) => {
+      const el = document.getElementById(`view-${v}`);
+      if (el) el.classList.toggle("hidden", v !== view);
+    });
+    if (view === "map") drawSonicMap();
+    if (view === "history") renderHistory();
+    if (view === "saved") renderSaved();
+  }
+
+  function formatTimestamp(ms) {
+    if (!ms) return "";
+    const d = new Date(ms);
+    const now = new Date();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    if (d.toDateString() === now.toDateString()) return `${hh}:${mm}`;
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mo = String(d.getMonth() + 1).padStart(2, "0");
+    return `${dd}.${mo}. ${hh}:${mm}`;
+  }
+
+  function actionLabel(action) {
+    switch (action) {
+      case "right":
+        return "IN CRATE";
+      case "up":
+        return "SUPER-SEED";
+      case "down":
+        return "KILL";
+      case "seed":
+        return "SEED";
+      default:
+        return "SKIP";
+    }
+  }
+
+  function renderHistory() {
+    const container = document.getElementById("history-list");
+    if (!container) return;
+    const q = (state.historyQuery || "").trim().toLowerCase();
+    const list = (state.library.history || []).filter((item) => {
+      if (state.historyFilter !== "all" && item.action !== state.historyFilter) return false;
+      if (!q) return true;
+      const hay = `${item.track.meta.artist} ${item.track.meta.title} ${item.seed_context}`.toLowerCase();
+      return hay.includes(q);
+    });
+
+    if (list.length === 0) {
+      container.innerHTML = `<div class="empty-hint">Keine Verlaufseintraege fuer diesen Filter.</div>`;
+      return;
+    }
+
+    container.innerHTML = list
+      .map((item, idx) => {
+        const t = item.track;
+        const saved = isTrackSaved(t.meta);
+        const isPlaying = state.playingLibraryId === `hist_${idx}_${t.meta.id}`;
+        return `
+        <div class="lib-row ${isPlaying ? "playing" : ""}" data-hist-idx="${idx}">
+          <img src="${escapeHtml(t.meta.cover_url)}" alt="">
+          <div class="lib-meta">
+            <div class="lib-title">${escapeHtml(t.meta.artist)} - ${escapeHtml(t.meta.title)}</div>
+            <div class="lib-sub">${t.dsp.bpm.toFixed(0)} BPM | Seed: ${escapeHtml(item.seed_context || "-")} | ${formatTimestamp(item.timestamp_ms)}</div>
+          </div>
+          <span class="action-pill act-${escapeHtml(item.action)}">${actionLabel(item.action)}</span>
+          <div class="lib-actions">
+            <button type="button" class="btn btn-small" data-lib-play="1">PLAY</button>
+            <button type="button" class="btn btn-small btn-bookmark ${saved ? "saved" : ""}" data-lib-save="${escapeHtml(t.meta.id)}">${saved ? "GEMERKT" : "MERKEN"}</button>
+            <button type="button" class="btn btn-small" data-lib-seed="${escapeHtml(t.meta.id)}" data-lib-label="${escapeHtml(t.meta.artist)} - ${escapeHtml(t.meta.title)}">SEED</button>
+            <a href="${escapeHtml(t.meta.spotify_search_url)}" target="_blank" rel="noopener" class="ext-link">SPOTIFY</a>
+          </div>
+        </div>
+      `;
+      })
+      .join("");
+
+    container.querySelectorAll(".lib-row").forEach((row) => {
+      const idx = parseInt(row.getAttribute("data-hist-idx"), 10);
+      const item = list[idx];
+      if (!item) return;
+      const t = item.track;
+      const playKey = `hist_${idx}_${t.meta.id}`;
+      row.querySelector("[data-lib-play]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        state.playingLibraryId = playKey;
+        loadAndPlayPreview(t.meta.id, t.meta.artist, t.meta.title, t.meta.preview_url, t.dsp.drop_start_sec || 0, true);
+        renderHistory();
+      });
+      row.querySelector("[data-lib-save]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        toggleSaveTrack(t.meta.id);
+      });
+      row.querySelector("[data-lib-seed]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        switchView("deck");
+        startSession(t.meta.id, `${t.meta.artist} - ${t.meta.title}`);
+      });
+    });
+  }
+
+  function renderSaved() {
+    const container = document.getElementById("saved-list");
+    if (!container) return;
+    const q = (state.savedQuery || "").trim().toLowerCase();
+    const list = (state.library.saved || []).filter((item) => {
+      if (!q) return true;
+      const hay = `${item.track.meta.artist} ${item.track.meta.title} ${item.track.meta.album}`.toLowerCase();
+      return hay.includes(q);
+    });
+
+    if (list.length === 0) {
+      container.innerHTML = `<div class="empty-hint">Noch keine Songs gemerkt. Druecke [B] oder klicke auf MERKEN bei einem Song.</div>`;
+      return;
+    }
+
+    container.innerHTML = list
+      .map((item, idx) => {
+        const t = item.track;
+        const isPlaying = state.playingLibraryId === `saved_${t.meta.id}`;
+        return `
+        <div class="lib-row ${isPlaying ? "playing" : ""}" data-saved-idx="${idx}">
+          <img src="${escapeHtml(t.meta.cover_url)}" alt="">
+          <div class="lib-meta">
+            <div class="lib-title">${escapeHtml(t.meta.artist)} - ${escapeHtml(t.meta.title)}</div>
+            <div class="lib-sub">${t.dsp.bpm.toFixed(0)} BPM | Drop @ ${(t.dsp.drop_start_sec || 0).toFixed(1)}s | Gemerkt: ${formatTimestamp(item.saved_at_ms)}</div>
+          </div>
+          <div class="lib-actions">
+            <button type="button" class="btn btn-small" data-lib-play="1">PLAY</button>
+            <button type="button" class="btn btn-small" data-lib-seed="${escapeHtml(t.meta.id)}">ALS SEED</button>
+            <a href="${escapeHtml(t.meta.spotify_search_url)}" target="_blank" rel="noopener" class="ext-link">SPOTIFY</a>
+            <button type="button" class="remove-x-btn" data-lib-del="${escapeHtml(t.meta.id)}" title="Aus Gemerkt entfernen">X</button>
+          </div>
+        </div>
+      `;
+      })
+      .join("");
+
+    container.querySelectorAll(".lib-row").forEach((row) => {
+      const idx = parseInt(row.getAttribute("data-saved-idx"), 10);
+      const item = list[idx];
+      if (!item) return;
+      const t = item.track;
+      const playKey = `saved_${t.meta.id}`;
+      row.querySelector("[data-lib-play]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        state.playingLibraryId = playKey;
+        loadAndPlayPreview(t.meta.id, t.meta.artist, t.meta.title, t.meta.preview_url, t.dsp.drop_start_sec || 0, true);
+        renderSaved();
+      });
+      row.querySelector("[data-lib-seed]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        switchView("deck");
+        startSession(t.meta.id, `${t.meta.artist} - ${t.meta.title}`);
+      });
+      row.querySelector("[data-lib-del]").addEventListener("click", (e) => {
+        e.currentTarget.blur();
+        removeSavedTrack(t.meta.id);
+      });
+    });
+  }
 
   function releaseFocus() {
     if (document.activeElement && typeof document.activeElement.blur === "function") {
@@ -234,6 +492,7 @@
         seedInput.value = `${snap.seeds[0].meta.artist} - ${snap.seeds[0].meta.title}`;
       }
       applySnapshot(snap, true);
+      refreshLibrary();
       releaseFocus();
     } catch (err) {
       showToast(`Analyse-Fehler: ${err.message}`, "error");
@@ -267,6 +526,7 @@
       bridgeInput.value = "";
       state.lastTrackId = null;
       applySnapshot(snap, true);
+      refreshLibrary();
       releaseFocus();
       showToast("Bridge-Anker hinzugefuegt.", "ok");
     } catch (err) {
@@ -303,6 +563,7 @@
       });
       state.lastTrackId = null;
       applySnapshot(snap, true);
+      refreshLibrary();
     } catch (err) {
       showToast(`Swipe fehlgeschlagen: ${err.message}`, "error");
     } finally {
@@ -617,7 +878,7 @@
         <img src="${escapeHtml(s.meta.cover_url)}" alt="">
         <div class="seed-info">
           <div class="seed-title">${escapeHtml(s.meta.artist)} - ${escapeHtml(s.meta.title)}</div>
-          <div class="seed-sub">${s.dsp.bpm.toFixed(0)} BPM | Drop @ ${s.dsp.drop_start_sec.toFixed(1)}s | Haerte: ${((s.dsp.aggression_index || 0.5) * 100).toFixed(0)}% | Dark: ${(s.dsp.darkness_index * 100).toFixed(0)}%</div>
+          <div class="seed-sub">${s.dsp.bpm.toFixed(0)} BPM | Drop ${s.dsp.drop_start_sec.toFixed(1)}s | H:${((s.dsp.aggression_index || 0.5) * 100).toFixed(0)}% D:${(s.dsp.darkness_index * 100).toFixed(0)}%</div>
         </div>
       </div>
     `
@@ -669,25 +930,35 @@
     }
     const reversed = crate.slice().reverse();
     container.innerHTML = reversed
-      .map(
-        (t, idx) => `
+      .map((t, idx) => {
+        const saved = isTrackSaved(t.meta);
+        return `
       <div class="list-track queue-clickable" data-crate-idx="${idx}" title="Klicken zum Anspielen">
         <img src="${escapeHtml(t.meta.cover_url)}" alt="">
         <div class="list-track-meta">
           <div class="list-track-title">${escapeHtml(t.meta.artist)} - ${escapeHtml(t.meta.title)}</div>
           <div class="list-track-sub">${t.dsp.bpm.toFixed(0)} BPM | Drop @ ${t.dsp.drop_start_sec.toFixed(1)}s</div>
         </div>
+        <button type="button" class="mini-save-btn ${saved ? "saved" : ""}" data-save-track="${escapeHtml(t.meta.id)}" title="Separat dauerhaft merken">M</button>
         <a href="${escapeHtml(t.meta.spotify_search_url)}" target="_blank" rel="noopener" class="ext-link" onclick="event.stopPropagation()">SPOTIFY</a>
         <button type="button" class="remove-x-btn" data-remove-crate="${escapeHtml(t.meta.id)}" title="Aus Crate entfernen">X</button>
       </div>
-    `
-      )
+    `;
+      })
       .join("");
 
     container.querySelectorAll(".list-track").forEach((el) => {
       el.addEventListener("click", () => {
         const idx = parseInt(el.getAttribute("data-crate-idx"), 10);
         if (reversed[idx]) enterPreviewMode(reversed[idx]);
+      });
+    });
+
+    container.querySelectorAll("[data-save-track]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        btn.blur();
+        toggleSaveTrack(btn.getAttribute("data-save-track"));
       });
     });
 
@@ -707,19 +978,29 @@
       return;
     }
     container.innerHTML = queue
-      .map(
-        (c, idx) => `
+      .map((c, idx) => {
+        const saved = isTrackSaved(c.track.meta);
+        return `
       <div class="list-track queue-clickable" data-focus-id="${escapeHtml(c.track.meta.id)}" title="Klicken, um direkt zu diesem Song zu wechseln">
         <span class="mono-badge">${String(idx + 2).padStart(2, "0")}</span>
         <div class="list-track-meta">
           <div class="list-track-title">${escapeHtml(c.track.meta.artist)} - ${escapeHtml(c.track.meta.title)}</div>
           <div class="list-track-sub">B:${c.beat_similarity.toFixed(0)}% V:${c.vocal_similarity.toFixed(0)}% A:${c.atmo_similarity.toFixed(0)}% | ${c.track.dsp.bpm.toFixed(0)} BPM</div>
         </div>
+        <button type="button" class="mini-save-btn ${saved ? "saved" : ""}" data-save-track="${escapeHtml(c.track.meta.id)}" title="Separat dauerhaft merken">M</button>
         <span class="list-track-score">${c.total_score.toFixed(1)}%</span>
       </div>
-    `
-      )
+    `;
+      })
       .join("");
+
+    container.querySelectorAll("[data-save-track]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        btn.blur();
+        toggleSaveTrack(btn.getAttribute("data-save-track"));
+      });
+    });
 
     container.querySelectorAll(".queue-clickable").forEach((el) => {
       el.addEventListener("click", () => {
@@ -755,6 +1036,7 @@
       .join("");
 
     document.getElementById("drop-time-label").textContent = `${track.dsp.drop_start_sec.toFixed(1)}s`;
+    updateSaveCardButton();
 
     drawWaveform();
 
@@ -1125,6 +1407,7 @@
       state.selectedMapPoint = best;
       document.getElementById("insp-title").textContent = `${best.artist} - ${best.title} (${best.total_score.toFixed(1)}%)`;
       document.getElementById("insp-sub").textContent = `${best.bpm.toFixed(0)} BPM | Beat: ${best.beat_similarity.toFixed(0)}% | Vocals: ${best.vocal_similarity.toFixed(0)}% | Atmo: ${best.atmo_similarity.toFixed(0)}%`;
+      document.getElementById("btn-insp-save").disabled = false;
       document.getElementById("btn-insp-like").disabled = best.kind === "seed";
       document.getElementById("btn-insp-kill").disabled = best.kind === "seed";
 
@@ -1140,13 +1423,22 @@
     }
   });
 
-  document.getElementById("btn-insp-like").addEventListener("click", () => {
+  document.getElementById("btn-insp-save").addEventListener("click", (e) => {
+    e.currentTarget.blur();
+    if (state.selectedMapPoint) {
+      toggleSaveTrack(state.selectedMapPoint.id);
+    }
+  });
+
+  document.getElementById("btn-insp-like").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     if (state.selectedMapPoint) {
       sendSwipe("right", state.selectedMapPoint.id);
     }
   });
 
-  document.getElementById("btn-insp-kill").addEventListener("click", () => {
+  document.getElementById("btn-insp-kill").addEventListener("click", (e) => {
+    e.currentTarget.blur();
     if (state.selectedMapPoint) {
       sendSwipe("down", state.selectedMapPoint.id);
     }
@@ -1155,20 +1447,97 @@
   // --- View Switcher Tabs ---
   document.querySelectorAll(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
+      btn.blur();
       const view = btn.getAttribute("data-view");
-      state.activeView = view;
-      if (view === "map") {
-        document.getElementById("view-deck").classList.add("hidden");
-        document.getElementById("view-map").classList.remove("hidden");
-        drawSonicMap();
-      } else {
-        document.getElementById("view-map").classList.add("hidden");
-        document.getElementById("view-deck").classList.remove("hidden");
-      }
+      if (view) switchView(view);
     });
   });
+
+  // --- History & Saved Toolbar Listeners ---
+  const historyFilters = document.getElementById("history-filters");
+  if (historyFilters) {
+    historyFilters.querySelectorAll("[data-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        btn.blur();
+        historyFilters.querySelectorAll("[data-filter]").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        state.historyFilter = btn.getAttribute("data-filter") || "all";
+        renderHistory();
+      });
+    });
+  }
+
+  const historySearch = document.getElementById("history-search");
+  if (historySearch) {
+    historySearch.addEventListener("input", () => {
+      state.historyQuery = historySearch.value;
+      renderHistory();
+    });
+  }
+
+  const btnClearHistory = document.getElementById("btn-clear-history");
+  if (btnClearHistory) {
+    btnClearHistory.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      clearHistory();
+    });
+  }
+
+  const savedSearch = document.getElementById("saved-search");
+  if (savedSearch) {
+    savedSearch.addEventListener("input", () => {
+      state.savedQuery = savedSearch.value;
+      renderSaved();
+    });
+  }
+
+  const btnSavedExpSpotify = document.getElementById("btn-saved-export-spotify");
+  if (btnSavedExpSpotify) {
+    btnSavedExpSpotify.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      const list = (state.library.saved || []).map((x) => x.track);
+      if (!list.length) return showToast("Keine gemerkten Songs vorhanden.", "info");
+      const lines = list.map((t) => `${t.meta.artist} - ${t.meta.title} | ${t.meta.spotify_search_url}`);
+      navigator.clipboard.writeText(lines.join("\n")).then(() => {
+        showToast(`${list.length} gemerkte Tracks + Spotify-Links kopiert.`, "ok");
+      });
+    });
+  }
+
+  const btnSavedExpM3u = document.getElementById("btn-saved-export-m3u");
+  if (btnSavedExpM3u) {
+    btnSavedExpM3u.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      const list = (state.library.saved || []).map((x) => x.track);
+      if (!list.length) return showToast("Keine gemerkten Songs vorhanden.", "info");
+      let m3u = "#EXTM3U\n";
+      for (const t of list) {
+        m3u += `#EXTINF:${t.meta.duration_sec || 180},${t.meta.artist} - ${t.meta.title}\n`;
+        m3u += `${t.meta.external_url || t.meta.spotify_search_url}\n`;
+      }
+      downloadBlob(m3u, "cratevec_gemerkt.m3u8", "audio/x-mpegurl");
+      showToast(`${list.length} gemerkte Tracks als .m3u8 exportiert.`, "ok");
+    });
+  }
+
+  const btnSavedExpJson = document.getElementById("btn-saved-export-json");
+  if (btnSavedExpJson) {
+    btnSavedExpJson.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      const list = state.library.saved || [];
+      if (!list.length) return showToast("Keine gemerkten Songs vorhanden.", "info");
+      downloadBlob(JSON.stringify(list, null, 2), "cratevec_gemerkt.json", "application/json");
+      showToast(`${list.length} gemerkte Tracks als JSON exportiert.`, "ok");
+    });
+  }
+
+  if (btnSaveCard) {
+    btnSaveCard.addEventListener("click", (e) => {
+      e.currentTarget.blur();
+      const card = state.snapshot && state.snapshot.current_card;
+      if (card) toggleSaveTrack(card.track.meta.id);
+    });
+  }
 
   // --- Form Submissions & Controls ---
   seedForm.addEventListener("submit", (e) => {
@@ -1328,6 +1697,10 @@
     } else if (e.key === "z" || e.key === "Z" || e.key === "Backspace") {
       e.preventDefault();
       undoLastSwipe();
+    } else if (e.key === "b" || e.key === "B") {
+      e.preventDefault();
+      const card = state.snapshot && state.snapshot.current_card;
+      if (card) toggleSaveTrack(card.track.meta.id);
     } else if (e.key === "m" || e.key === "M") {
       e.preventDefault();
       if (btnMute) btnMute.click();
@@ -1456,6 +1829,7 @@
   initVolume();
   updateNodeLabel();
   drawTriangleMixer();
+  refreshLibrary();
 
   apiFetch("/api/session/snapshot")
     .then((snap) => {
